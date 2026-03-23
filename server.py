@@ -282,19 +282,6 @@ async def get_current_user(authorization: str = Header(None), request: Request =
         raise HTTPException(status_code=401, detail="User not found")
     
     # Check for active bans
-    active_ban = bans_col.find_one({
-        "userId": user_id,
-        "isActive": True,
-        "banType": {"$ne": "MATCH_TERMINATION"},
-        "$or": [
-            {"expiresAt": None},
-            {"expiresAt": {"$gt": datetime.now(timezone.utc)}}
-        ]
-    })
-    
-    if active_ban and active_ban["banType"] == "PERMANENT":
-        raise HTTPException(status_code=403, detail="Account permanently banned")
-    
     return serialize_doc(user)
 
 async def get_admin_user(authorization: str = Header(None)):
@@ -482,10 +469,7 @@ async def login(credentials: UserLogin, request: Request):
     if not user or not verify_password(credentials.password, user["passwordHash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
-    if not user.get("isActive"):
-        raise HTTPException(status_code=403, detail="Account is deactivated")
-    
-    # Check active ban
+    # Check active ban - allow login but return ban details
     active_ban = bans_col.find_one({
         "userId": str(user["_id"]),
         "isActive": True,
@@ -495,17 +479,6 @@ async def login(credentials: UserLogin, request: Request):
             {"expiresAt": {"$gt": datetime.now(timezone.utc)}}
         ]
     })
-    
-    if active_ban:
-        ban_type = active_ban["banType"]
-        if ban_type == "PERMANENT":
-            raise HTTPException(status_code=403, detail="Account permanently banned")
-        else:
-            expires = active_ban.get("expiresAt")
-            if expires and expires.tzinfo is None:
-                expires = expires.replace(tzinfo=timezone.utc)
-            exp_str = expires.isoformat() if expires else "indefinitely"
-            raise HTTPException(status_code=403, detail=f"Account banned until {exp_str}")
     
     # Clear rate limit on successful login
     clear_rate_limit(f"login:{ip}")
@@ -529,8 +502,26 @@ async def login(credentials: UserLogin, request: Request):
     
     token = create_access_token({"sub": str(user["_id"]), "role": user["role"]})
     
+    # Prepare ban info for response
+    ban_info = None
+    if active_ban:
+        expires = active_ban.get("expiresAt")
+        if expires and expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        ban_info = {
+            "id": str(active_ban["_id"]),
+            "banType": active_ban["banType"],
+            "reason": active_ban.get("reason", ""),
+            "expiresAt": expires.isoformat() if expires else None,
+            "isActive": True,
+            "appealStatus": active_ban.get("appealStatus"),
+            "appealText": active_ban.get("appealText")
+        }
+    
     return {
         "token": token,
+        "isBanned": ban_info is not None,
+        "activeBan": ban_info,
         "user": {
             "id": str(user["_id"]),
             "fullName": user["fullName"],
@@ -541,7 +532,8 @@ async def login(credentials: UserLogin, request: Request):
             "role": user["role"],
             "walletBalance": user.get("walletBalance", 0),
             "emailVerified": user.get("emailVerified", False),
-            "mobileVerified": user.get("mobileVerified", False)
+            "mobileVerified": user.get("mobileVerified", False),
+            "isActive": user.get("isActive", True)
         }
     }
 
@@ -598,20 +590,44 @@ async def get_me(user: dict = Depends(get_current_user)):
                 })
         team["memberDetails"] = members
     
-    # Get active ban
-    active_ban = bans_col.find_one({
-        "userId": user["id"],
-        "isActive": True,
-        "$or": [
-            {"expiresAt": None},
-            {"expiresAt": {"$gt": datetime.now(timezone.utc)}}
-        ]
-    })
+    # Get active ban (excluding expired ones with timezone fix)
+    now = datetime.now(timezone.utc)
+    all_bans = list(bans_col.find({"userId": user["id"], "isActive": True}))
+    active_ban = None
+    for b in all_bans:
+        if b.get("banType") == "MATCH_TERMINATION":
+            continue
+        exp = b.get("expiresAt")
+        if exp is None:
+            active_ban = b
+            break
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if exp > now:
+            active_ban = b
+            break
+    
+    ban_data = None
+    if active_ban:
+        exp = active_ban.get("expiresAt")
+        if exp and exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        ban_data = {
+            "id": str(active_ban["_id"]),
+            "banType": active_ban["banType"],
+            "reason": active_ban.get("reason", ""),
+            "expiresAt": exp.isoformat() if exp else None,
+            "isActive": True,
+            "appealStatus": active_ban.get("appealStatus"),
+            "appealText": active_ban.get("appealText"),
+            "appealedAt": active_ban.get("appealedAt").isoformat() if active_ban.get("appealedAt") else None
+        }
     
     return {
         **user,
         "team": team,
-        "activeBan": serialize_doc(active_ban) if active_ban else None
+        "activeBan": ban_data,
+        "isBanned": ban_data is not None
     }
 
 @app.post("/api/auth/verify-email")
