@@ -311,11 +311,23 @@ def check_rate_limit(key: str, limit: int = 5, window_minutes: int = 15) -> bool
     now = datetime.now(timezone.utc)
     
     if entry:
-        if entry["resetAt"] > now:
-            if entry["count"] >= limit:
-                return False
-            rate_limits_col.update_one({"key": key}, {"$inc": {"count": 1}})
-        else:
+        try:
+            # Fix: MongoDB may return naive datetime - make it timezone-aware
+            reset_at = entry["resetAt"]
+            if reset_at.tzinfo is None:
+                reset_at = reset_at.replace(tzinfo=timezone.utc)
+            
+            if reset_at > now:
+                if entry["count"] >= limit:
+                    return False
+                rate_limits_col.update_one({"key": key}, {"$inc": {"count": 1}})
+            else:
+                rate_limits_col.update_one(
+                    {"key": key},
+                    {"$set": {"count": 1, "resetAt": now + timedelta(minutes=window_minutes)}}
+                )
+        except Exception:
+            # If any comparison fails, reset the entry
             rate_limits_col.update_one(
                 {"key": key},
                 {"$set": {"count": 1, "resetAt": now + timedelta(minutes=window_minutes)}}
@@ -724,6 +736,9 @@ async def update_player_profile(updates: UserUpdate, user: dict = Depends(get_cu
         last_update = user.get("ignUpdatedAt")
         if last_update:
             last_dt = datetime.fromisoformat(last_update) if isinstance(last_update, str) else last_update
+            # Fix timezone awareness
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
             if datetime.now(timezone.utc) - last_dt < timedelta(days=30):
                 days_left = 30 - (datetime.now(timezone.utc) - last_dt).days
                 raise HTTPException(status_code=400, detail=f"IGN can be changed in {days_left} days")
