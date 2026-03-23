@@ -351,8 +351,17 @@ async def register(user_data: UserRegister, request: Request):
         raise HTTPException(status_code=400, detail="Free Fire UID already registered")
     
     # Check age (must be 13+)
-    dob = datetime.fromisoformat(user_data.dob.replace("Z", "+00:00"))
-    age = (datetime.now(timezone.utc) - dob).days // 365
+    try:
+        dob_str = user_data.dob.replace("Z", "+00:00")
+        dob = datetime.fromisoformat(dob_str)
+        # Make both timezone-aware or both naive
+        if dob.tzinfo is not None:
+            now = datetime.now(timezone.utc)
+        else:
+            now = datetime.now()
+        age = (now - dob).days // 365
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid date of birth format")
     if age < 13:
         raise HTTPException(status_code=400, detail="Must be at least 13 years old")
     
@@ -1335,10 +1344,13 @@ async def razorpay_webhook(request: Request):
     body = await request.body()
     signature = request.headers.get("x-razorpay-signature", "")
     
-    # Verify webhook (mock for demo)
-    # In production: verify HMAC SHA256
+    if not body:
+        return {"status": "ok"}
     
-    data = json.loads(body)
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return {"status": "ok"}
     event = data.get("event")
     
     if event == "payment.captured":
