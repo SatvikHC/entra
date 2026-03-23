@@ -1964,6 +1964,136 @@ async def admin_dashboard(admin: dict = Depends(get_admin_user)):
         "recentRegistrations": recent_data
     }
 
+
+@app.put("/api/admin/tournaments/{tournament_id}/edit")
+async def edit_tournament_details(tournament_id: str, data: dict, admin: dict = Depends(get_admin_user)):
+    """Full edit of any tournament field"""
+    tournament = tournaments_col.find_one({"_id": ObjectId(tournament_id)})
+    if not tournament:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    allowed = ["name","map","maps","scheduledAt","entryFee","maxTeams","prizePool",
+               "perKillPrize","rules","youtubeUrl","status","roomId","roomPassword",
+               "description","bannerUrl","matchCount"]
+    update = {k: v for k, v in data.items() if k in allowed}
+    if "scheduledAt" in update and isinstance(update["scheduledAt"], str):
+        try:
+            update["scheduledAt"] = datetime.fromisoformat(update["scheduledAt"].replace("Z","")).replace(tzinfo=timezone.utc)
+        except: pass
+    update["updatedAt"] = datetime.now(timezone.utc)
+    tournaments_col.update_one({"_id": ObjectId(tournament_id)}, {"$set": update})
+    return {"message": "Tournament updated"}
+
+@app.get("/api/admin/cups")
+async def get_all_cups(admin: dict = Depends(get_admin_user)):
+    cups = list(db["cups"].find().sort("createdAt", DESCENDING))
+    result = []
+    for cup in cups:
+        qualifiers = list(tournaments_col.find({"cupId": str(cup["_id"]), "tournamentType": "QUALIFIER"}))
+        finals = tournaments_col.find_one({"cupId": str(cup["_id"]), "tournamentType": "FINALS"})
+        result.append({
+            **serialize_doc(cup),
+            "qualifierCount": len(qualifiers),
+            "qualifiers": [{"id": str(q["_id"]), "name": q["name"], "status": q["status"], "qualifierNumber": q.get("qualifierNumber")} for q in qualifiers],
+            "finals": {"id": str(finals["_id"]), "name": finals["name"], "status": finals["status"]} if finals else None
+        })
+    return result
+
+@app.post("/api/admin/cup-tournaments")
+async def create_cup_tournament(data: dict, admin: dict = Depends(get_admin_user)):
+    """Create Cup with qualifiers auto-generated"""
+    import random as rand_mod
+    cup_name = data.get("name","OSG Cup")
+    num_q = int(data.get("numQualifiers",2))
+    teams_per_q = int(data.get("teamsPerQualifier",12))
+    maps_per_q = data.get("mapsPerQualifier",["BERMUDA","PURGATORY","KALAHARI"])
+    finals_teams = int(data.get("finalsTeams",6))
+    entry_fee = float(data.get("entryFee",50))
+    prize_pool = data.get("prizePool",{"1":1000,"2":500,"3":300})
+    per_kill = float(data.get("perKillPrize",5))
+    rules = data.get("rules","Standard OSG Cup rules.")
+    scheduled_str = data.get("scheduledAt")
+    scheduled_at = datetime.now(timezone.utc) + timedelta(days=3)
+    if scheduled_str:
+        try: scheduled_at = datetime.fromisoformat(scheduled_str.replace("Z","")).replace(tzinfo=timezone.utc)
+        except: pass
+
+    cup = db["cups"].insert_one({
+        "name": cup_name, "status": "UPCOMING",
+        "numQualifiers": num_q, "teamsPerQualifier": teams_per_q,
+        "mapsPerQualifier": maps_per_q, "finalsTeams": finals_teams,
+        "finalsGenerated": False, "entryFee": entry_fee,
+        "prizePool": prize_pool, "perKillPrize": per_kill,
+        "rules": rules, "createdBy": admin["id"],
+        "createdAt": datetime.now(timezone.utc),
+    })
+    cup_id = str(cup.inserted_id)
+    created = []
+    for q in range(1, num_q+1):
+        t = tournaments_col.insert_one({
+            "name": f"{cup_name} — Qualifier {q}",
+            "cupId": cup_id, "cupName": cup_name,
+            "tournamentType": "QUALIFIER", "qualifierNumber": q,
+            "map": maps_per_q[0] if maps_per_q else "BERMUDA",
+            "maps": maps_per_q, "matchCount": len(maps_per_q),
+            "scheduledAt": scheduled_at + timedelta(days=(q-1)*2),
+            "entryFee": entry_fee, "maxTeams": teams_per_q,
+            "playersPerTeam": 4, "prizePool": {},
+            "perKillPrize": per_kill, "rules": rules,
+            "status": "UPCOMING", "totalSlots": teams_per_q,
+            "filledSlots": 0,
+            "finalsTeamsCount": max(1, finals_teams // num_q),
+            "createdAt": datetime.now(timezone.utc),
+            "updatedAt": datetime.now(timezone.utc)
+        })
+        t_id = str(t.inserted_id)
+        for mi, map_name in enumerate(maps_per_q):
+            matches_col.insert_one({"tournamentId": t_id, "matchNumber": mi+1, "mapName": map_name, "status": "PENDING", "createdAt": datetime.now(timezone.utc)})
+        created.append({"id": t_id, "name": f"Qualifier {q}"})
+    return {"message": f"Cup created with {num_q} qualifiers", "cupId": cup_id, "tournaments": created}
+
+@app.post("/api/admin/cups/{cup_id}/generate-finals")
+async def generate_cup_finals(cup_id: str, admin: dict = Depends(get_admin_user)):
+    """Auto-generate finals from qualifier standings"""
+    cup = db["cups"].find_one({"_id": ObjectId(cup_id)})
+    if not cup:
+        raise HTTPException(status_code=404, detail="Cup not found")
+    qualifiers = list(tournaments_col.find({"cupId": cup_id, "tournamentType": "QUALIFIER"}))
+    if not qualifiers:
+        raise HTTPException(status_code=400, detail="No qualifiers found")
+    per_q = max(1, cup["finalsTeams"] // len(qualifiers))
+    advancing = []
+    for q in qualifiers:
+        standings = await get_tournament_standings(str(q["_id"]))
+        for team in standings[:per_q]:
+            advancing.append({"teamId": team["teamId"], "teamName": team["teamName"], "fromQualifier": q.get("qualifierNumber",1), "qualifierPoints": team["totalPoints"]})
+    if len(advancing) < 2:
+        raise HTTPException(status_code=400, detail="Not enough teams qualified. Enter match results first.")
+    finals_maps = cup.get("mapsPerQualifier",["BERMUDA","PURGATORY","KALAHARI","ALPHINE","NEXTERRA","SOLARA"])[:6]
+    finals = tournaments_col.insert_one({
+        "name": f"{cup['name']} — Finals", "cupId": cup_id, "cupName": cup["name"],
+        "tournamentType": "FINALS", "map": finals_maps[0], "maps": finals_maps,
+        "matchCount": len(finals_maps),
+        "scheduledAt": datetime.now(timezone.utc) + timedelta(days=7),
+        "entryFee": 0, "maxTeams": len(advancing), "playersPerTeam": 4,
+        "prizePool": cup.get("prizePool",{"1":1000}),
+        "perKillPrize": cup.get("perKillPrize",5),
+        "rules": cup.get("rules",""), "status": "UPCOMING",
+        "totalSlots": len(advancing), "filledSlots": len(advancing),
+        "advancingTeams": advancing,
+        "createdAt": datetime.now(timezone.utc), "updatedAt": datetime.now(timezone.utc)
+    })
+    finals_id = str(finals.inserted_id)
+    for mi, map_name in enumerate(finals_maps):
+        matches_col.insert_one({"tournamentId": finals_id, "matchNumber": mi+1, "mapName": map_name, "status": "PENDING", "createdAt": datetime.now(timezone.utc)})
+    for si, team_info in enumerate(advancing):
+        registrations_col.update_one(
+            {"tournamentId": finals_id, "teamId": team_info["teamId"]},
+            {"$set": {"tournamentId": finals_id, "teamId": team_info["teamId"], "slotNumber": si+1, "paymentStatus": "PAID", "amountPaid": 0, "fromQualifier": team_info["fromQualifier"], "registeredAt": datetime.now(timezone.utc), "confirmedAt": datetime.now(timezone.utc)}},
+            upsert=True
+        )
+    db["cups"].update_one({"_id": ObjectId(cup_id)}, {"$set": {"finalsGenerated": True, "finalsId": finals_id}})
+    return {"message": f"Finals created with {len(advancing)} teams", "finalsId": finals_id, "advancingTeams": advancing}
+
 @app.post("/api/admin/tournaments")
 async def create_tournament(data: TournamentCreate, admin: dict = Depends(get_admin_user)):
     tournament_doc = {
