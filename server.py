@@ -6,6 +6,9 @@ Complete FastAPI backend with MongoDB
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta, timezone
@@ -66,6 +69,31 @@ banned_ips_col.create_index("ip", unique=True)
 
 # JWT Settings
 SECRET_KEY = os.environ.get("JWT_SECRET", "osg-live-super-secret-key-2024")
+
+# SMTP Email Config
+SMTP_HOST = os.environ.get("SMTP_HOST", "tg.toonverse.icu")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
+SMTP_USER = os.environ.get("SMTP_USER", "otp@tg.toonverse.icu")
+SMTP_PASS = os.environ.get("SMTP_PASS", "BWoX@a&gGJ8JHD!,")
+SMTP_FROM = os.environ.get("SMTP_FROM", "OSG LIVE <otp@tg.toonverse.icu>")
+
+def send_email(to_email: str, subject: str, html_body: str):
+    """Send email via cPanel SMTP"""
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = SMTP_FROM
+        msg["To"] = to_email
+        msg.attach(MIMEText(html_body, "html"))
+        
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, to_email, msg.as_string())
+        print(f"[EMAIL] Sent to {to_email}: {subject}")
+        return True
+    except Exception as e:
+        print(f"[EMAIL ERROR] Failed to send to {to_email}: {e}")
+        return False
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 7
 
@@ -656,8 +684,8 @@ async def send_otp(mobile: str, request: Request):
     if not check_rate_limit(f"otp:{ip}"):
         raise HTTPException(status_code=429, detail="Too many OTP requests")
     
-    # Generate OTP
-    otp = "123456"  # Mock OTP for demo
+    import random as rand_mod
+    otp = str(rand_mod.randint(100000, 999999))
     
     otp_codes_col.insert_one({
         "mobile": mobile,
@@ -668,9 +696,63 @@ async def send_otp(mobile: str, request: Request):
         "createdAt": datetime.now(timezone.utc)
     })
     
-    print(f"[SMS] OTP {otp} sent to {mobile}")
+    print(f"[OTP] {otp} for {mobile}")
+    return {"message": "OTP sent successfully", "otp_debug": otp}
+
+@app.post("/api/auth/send-email-otp")
+async def send_email_otp(email: str, request: Request):
+    """Send OTP to email for verification"""
+    ip = get_client_ip(request)
+    if not check_rate_limit(f"email_otp:{ip}", limit=5, window_minutes=15):
+        raise HTTPException(status_code=429, detail="Too many OTP requests")
     
-    return {"message": "OTP sent successfully"}
+    import random as rand_mod
+    otp = str(rand_mod.randint(100000, 999999))
+    
+    otp_codes_col.insert_one({
+        "email": email,
+        "code": otp,
+        "purpose": "email_verification",
+        "isUsed": False,
+        "expiresAt": datetime.now(timezone.utc) + timedelta(minutes=10),
+        "createdAt": datetime.now(timezone.utc)
+    })
+    
+    html = f"""
+    <div style="background:#0A0A0A;padding:40px;font-family:Arial">
+      <h2 style="color:#FF6B00">OSG LIVE</h2>
+      <h3 style="color:white">Email Verification OTP</h3>
+      <div style="background:#1A1A1A;border:1px solid #FF6B00;border-radius:8px;padding:20px;text-align:center">
+        <p style="color:#A1A1AA">Your OTP code is:</p>
+        <div style="font-size:48px;font-weight:bold;color:#FFD700;letter-spacing:8px">{otp}</div>
+        <p style="color:#52525B;font-size:12px">Valid for 10 minutes. Do not share this code.</p>
+      </div>
+      <p style="color:#52525B;font-size:11px;margin-top:20px">OSG LIVE | support@tg.toonverse.icu</p>
+    </div>
+    """
+    
+    sent = send_email(email, "OSG LIVE - Email Verification OTP", html)
+    
+    return {"message": "OTP sent to your email", "sent": sent}
+
+@app.post("/api/auth/verify-email-otp")
+async def verify_email_otp_code(email: str, code: str):
+    """Verify email OTP"""
+    otp_doc = otp_codes_col.find_one({
+        "email": email,
+        "code": code,
+        "purpose": "email_verification",
+        "isUsed": False,
+        "expiresAt": {"$gt": datetime.now(timezone.utc)}
+    })
+    
+    if not otp_doc:
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+    
+    otp_codes_col.update_one({"_id": otp_doc["_id"]}, {"$set": {"isUsed": True}})
+    users_col.update_one({"email": email}, {"$set": {"emailVerified": True}})
+    
+    return {"message": "Email verified successfully"}
 
 @app.post("/api/auth/verify-otp")
 async def verify_otp(mobile: str, code: str):
@@ -1717,19 +1799,29 @@ async def get_leaderboard(period: str = "all"):
         except Exception:
             continue
         if team:
-            captain = users_col.find_one({"_id": ObjectId(team["captainId"])})
-            # Get total earnings from prizes
-            earnings = transactions_col.aggregate([
-                {"$match": {"userId": team["captainId"], "type": "PRIZE"}},
-                {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-            ])
-            earnings_list = list(earnings)
-            total_earnings = earnings_list[0]["total"] if earnings_list else 0
+            # Safe ObjectId conversion
+            captain = None
+            try:
+                captain = users_col.find_one({"_id": ObjectId(team["captainId"])})
+            except Exception:
+                pass
+            
+            # Get total earnings
+            total_earnings = 0
+            try:
+                earnings = transactions_col.aggregate([
+                    {"$match": {"userId": str(team.get("captainId", "")), "type": "PRIZE"}},
+                    {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
+                ])
+                earnings_list = list(earnings)
+                total_earnings = earnings_list[0]["total"] if earnings_list else 0
+            except Exception:
+                pass
 
             leaderboard.append({
                 "rank": i + 1,
                 "teamName": team["name"],
-                "captainIgn": captain["ign"] if captain else "Unknown",
+                "captainIgn": captain["ign"] if captain else team.get("name", "Unknown"),
                 "totalKills": entry["totalKills"],
                 "totalWins": entry["totalWins"],
                 "totalPlacementPts": entry["totalPlacementPts"],
@@ -2123,7 +2215,10 @@ async def distribute_prizes(tournament_id: str, admin: dict = Depends(get_admin_
                 share = total_prize / len(team_doc.get("members", []))
                 
                 for member_id in team_doc.get("members", []):
-                    user = users_col.find_one({"_id": ObjectId(member_id)})
+                    try:
+                        user = users_col.find_one({"_id": ObjectId(member_id)})
+                    except Exception:
+                        user = None
                     if user:
                         new_balance = user.get("walletBalance", 0) + share
                         users_col.update_one(
@@ -2555,13 +2650,17 @@ async def seed_test_tournament():
         existing_team = teams_col.find_one({"name": name})
         if existing_team:
             team_ids.append(str(existing_team["_id"]))
-            t_doc = existing_team
         else:
+            admin_user = users_col.find_one({"role": "ADMIN"})
+            admin_id = str(admin_user["_id"]) if admin_user else None
+            if not admin_id:
+                continue
             t_doc = teams_col.insert_one({
                 "name": name,
-                "captainId": "test_captain",
-                "members": ["test_member"],
+                "captainId": admin_id,
+                "members": [admin_id],
                 "isActive": True,
+                "isTestTeam": True,
                 "createdAt": datetime.now(timezone.utc),
                 "updatedAt": datetime.now(timezone.utc)
             })
@@ -2622,6 +2721,145 @@ async def seed_test_tournament():
         "note": "Go to Admin → Tournaments → OSG Test Tournament → Standings to see results",
         "adminUrl": "/admin/tournaments/" + t_id
     }
+
+@app.delete("/api/seed/test-tournament")
+async def delete_test_tournament():
+    """Delete all test tournament data"""
+    deleted = {"tournaments": 0, "teams": 0, "registrations": 0, "matches": 0, "results": 0}
+    
+    # Find and delete test tournament
+    test_t = tournaments_col.find_one({"name": "OSG Test Tournament"})
+    if test_t:
+        t_id = str(test_t["_id"])
+        # Delete match results
+        test_matches = list(matches_col.find({"tournamentId": t_id}))
+        for m in test_matches:
+            r = match_results_col.delete_many({"matchId": str(m["_id"])})
+            deleted["results"] += r.deleted_count
+        # Delete matches
+        m = matches_col.delete_many({"tournamentId": t_id})
+        deleted["matches"] = m.deleted_count
+        # Delete registrations and test teams
+        regs = list(registrations_col.find({"tournamentId": t_id}))
+        for reg in regs:
+            team = teams_col.find_one({"_id": ObjectId(reg["teamId"]), "isTestTeam": True})
+            if team:
+                teams_col.delete_one({"_id": team["_id"]})
+                deleted["teams"] += 1
+        r = registrations_col.delete_many({"tournamentId": t_id})
+        deleted["registrations"] = r.deleted_count
+        # Delete tournament
+        tournaments_col.delete_one({"_id": test_t["_id"]})
+        deleted["tournaments"] = 1
+    
+    return {"message": "Test tournament deleted", "deleted": deleted}
+
+@app.post("/api/seed/test-users")
+async def seed_test_users():
+    """Create 12 test player accounts with teams"""
+    from bson import ObjectId as BsonObjectId
+    
+    test_players = [
+        {"ign": "TestPlayer1", "ffUid": "100000001", "mobile": "8000000001", "email": "test1@osglive.in"},
+        {"ign": "TestPlayer2", "ffUid": "100000002", "mobile": "8000000002", "email": "test2@osglive.in"},
+        {"ign": "TestPlayer3", "ffUid": "100000003", "mobile": "8000000003", "email": "test3@osglive.in"},
+        {"ign": "TestPlayer4", "ffUid": "100000004", "mobile": "8000000004", "email": "test4@osglive.in"},
+        {"ign": "TestPlayer5", "ffUid": "100000005", "mobile": "8000000005", "email": "test5@osglive.in"},
+        {"ign": "TestPlayer6", "ffUid": "100000006", "mobile": "8000000006", "email": "test6@osglive.in"},
+        {"ign": "TestPlayer7", "ffUid": "100000007", "mobile": "8000000007", "email": "test7@osglive.in"},
+        {"ign": "TestPlayer8", "ffUid": "100000008", "mobile": "8000000008", "email": "test8@osglive.in"},
+        {"ign": "TestPlayer9", "ffUid": "100000009", "mobile": "8000000009", "email": "test9@osglive.in"},
+        {"ign": "TestPlayer10", "ffUid": "100000010", "mobile": "8000000010", "email": "test10@osglive.in"},
+        {"ign": "TestPlayer11", "ffUid": "100000011", "mobile": "8000000011", "email": "test11@osglive.in"},
+        {"ign": "TestPlayer12", "ffUid": "100000012", "mobile": "8000000012", "email": "test12@osglive.in"},
+    ]
+    
+    created_users = []
+    for p in test_players:
+        existing = users_col.find_one({"ffUid": p["ffUid"]})
+        if existing:
+            created_users.append(str(existing["_id"]))
+            continue
+        result = users_col.insert_one({
+            "fullName": p["ign"],
+            "email": p["email"],
+            "emailVerified": True,
+            "mobile": p["mobile"],
+            "mobileVerified": True,
+            "passwordHash": get_password_hash("Test@1234"),
+            "ffUid": p["ffUid"],
+            "ign": p["ign"],
+            "state": "Telangana",
+            "dob": datetime(2000, 1, 1, tzinfo=timezone.utc),
+            "role": "PLAYER",
+            "walletBalance": 0,
+            "isActive": True,
+            "isTestUser": True,
+            "registeredIp": "127.0.0.1",
+            "createdAt": datetime.now(timezone.utc),
+            "updatedAt": datetime.now(timezone.utc)
+        })
+        created_users.append(str(result.inserted_id))
+    
+    # Create 3 test teams of 4 players each
+    team_data = [
+        {"name": "Test Team Alpha", "members": created_users[0:4]},
+        {"name": "Test Team Beta", "members": created_users[4:8]},
+        {"name": "Test Team Gamma", "members": created_users[8:12]},
+    ]
+    
+    created_teams = []
+    for td in team_data:
+        existing = teams_col.find_one({"name": td["name"]})
+        if not existing:
+            result = teams_col.insert_one({
+                "name": td["name"],
+                "captainId": td["members"][0],
+                "members": td["members"],
+                "isActive": True,
+                "isTestTeam": True,
+                "createdAt": datetime.now(timezone.utc),
+                "updatedAt": datetime.now(timezone.utc)
+            })
+            created_teams.append(str(result.inserted_id))
+        else:
+            created_teams.append(str(existing["_id"]))
+    
+    return {
+        "message": "12 test players + 3 teams created",
+        "users": len(created_users),
+        "teams": len(created_teams),
+        "credentials": "All test players: password = Test@1234",
+        "testLogins": [{"email": p["email"], "password": "Test@1234"} for p in test_players[:3]]
+    }
+
+@app.delete("/api/seed/test-users")
+async def delete_test_users():
+    """Delete all test users and their teams"""
+    users_result = users_col.delete_many({"isTestUser": True})
+    teams_result = teams_col.delete_many({"isTestTeam": True})
+    return {
+        "message": "Test users and teams deleted",
+        "usersDeleted": users_result.deleted_count,
+        "teamsDeleted": teams_result.deleted_count
+    }
+
+@app.delete("/api/admin/tournaments/{tournament_id}")
+async def delete_tournament(tournament_id: str, admin: dict = Depends(get_admin_user)):
+    """Delete a tournament and all its data"""
+    tournament = tournaments_col.find_one({"_id": ObjectId(tournament_id)})
+    if not tournament:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    
+    # Delete all related data
+    matches = list(matches_col.find({"tournamentId": tournament_id}))
+    for m in matches:
+        match_results_col.delete_many({"matchId": str(m["_id"])})
+    matches_col.delete_many({"tournamentId": tournament_id})
+    registrations_col.delete_many({"tournamentId": tournament_id})
+    tournaments_col.delete_one({"_id": ObjectId(tournament_id)})
+    
+    return {"message": f"Tournament '{tournament['name']}' deleted successfully"}
 
 # ============== ADMIN APPEAL MANAGEMENT ==============
 @app.get("/api/admin/appeals")
