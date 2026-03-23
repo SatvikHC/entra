@@ -219,6 +219,15 @@ class WithdrawalProcess(BaseModel):
     utrNumber: Optional[str] = None
     rejectionReason: Optional[str] = None
 
+class WalletTopupRequest(BaseModel):
+    amount: float = Field(..., ge=10, le=10000)
+    utrNumber: str = Field(..., min_length=6)
+    paymentMethod: str = "UPI"
+    screenshotNote: Optional[str] = None
+
+class RedeemCodeRequest(BaseModel):
+    code: str = Field(..., min_length=4, max_length=20)
+
 class PaymentVerify(BaseModel):
     orderId: str
     paymentId: str
@@ -856,6 +865,237 @@ async def create_withdrawal(data: WithdrawalCreate, user: dict = Depends(get_cur
 async def get_withdrawals(user: dict = Depends(get_current_user)):
     withdrawals = list(withdrawals_col.find({"userId": user["id"]}).sort("requestedAt", DESCENDING))
     return [serialize_doc(w) for w in withdrawals]
+
+# ============== WALLET TOPUP ROUTES ==============
+
+@app.get("/api/admin/payment-settings")
+async def get_payment_settings_public():
+    """Get payment settings - public for wallet page"""
+    settings = db["settings"].find_one({"key": "payment_settings"})
+    if not settings:
+        # Default settings
+        return {
+            "upiEnabled": True,
+            "redeemEnabled": True,
+            "razorpayEnabled": False,
+            "upiId": "osglive@upi",
+            "qrCodeUrl": "",
+            "minTopup": 10,
+            "maxTopup": 10000
+        }
+    return {
+        "upiEnabled": settings.get("upiEnabled", True),
+        "redeemEnabled": settings.get("redeemEnabled", True),
+        "razorpayEnabled": settings.get("razorpayEnabled", False),
+        "upiId": settings.get("upiId", "osglive@upi"),
+        "qrCodeUrl": settings.get("qrCodeUrl", ""),
+        "minTopup": settings.get("minTopup", 10),
+        "maxTopup": settings.get("maxTopup", 10000)
+    }
+
+@app.post("/api/player/wallet/topup-request")
+async def request_wallet_topup(data: WalletTopupRequest, user: dict = Depends(get_current_user)):
+    """Player submits UTR number for wallet topup verification"""
+    # Check for duplicate UTR
+    existing = db["topup_requests"].find_one({"utrNumber": data.utrNumber})
+    if existing:
+        raise HTTPException(status_code=400, detail="This UTR number has already been used")
+    
+    topup_doc = {
+        "userId": user["id"],
+        "amount": data.amount,
+        "utrNumber": data.utrNumber.strip(),
+        "paymentMethod": data.paymentMethod,
+        "screenshotNote": data.screenshotNote,
+        "status": "PENDING",
+        "requestedAt": datetime.now(timezone.utc)
+    }
+    result = db["topup_requests"].insert_one(topup_doc)
+    
+    # Notify admin
+    admin = users_col.find_one({"role": "ADMIN"})
+    if admin:
+        notifications_col.insert_one({
+            "userId": str(admin["_id"]),
+            "title": "💰 Wallet Topup Request",
+            "message": f"{user.get('ign')} requested ₹{data.amount} topup (UTR: {data.utrNumber})",
+            "type": "INFO",
+            "isRead": False,
+            "link": "/admin/withdrawals",
+            "createdAt": datetime.now(timezone.utc)
+        })
+    
+    return {"message": "Topup request submitted. Admin will verify and credit within 30 minutes.", "id": str(result.inserted_id)}
+
+@app.post("/api/player/wallet/redeem")
+async def redeem_wallet_code(data: RedeemCodeRequest, user: dict = Depends(get_current_user)):
+    """Redeem a gift/promo code for wallet credit"""
+    code = db["redeem_codes"].find_one({
+        "code": data.code.upper().strip(),
+        "isActive": True,
+        "expiresAt": {"$gt": datetime.now(timezone.utc)}
+    })
+    
+    if not code:
+        raise HTTPException(status_code=400, detail="Invalid or expired redeem code")
+    
+    # Check if already used by this user
+    if user["id"] in code.get("usedBy", []):
+        raise HTTPException(status_code=400, detail="You have already used this code")
+    
+    # Check max uses
+    if code.get("maxUses") and len(code.get("usedBy", [])) >= code["maxUses"]:
+        raise HTTPException(status_code=400, detail="This code has reached its maximum uses")
+    
+    amount = code["amount"]
+    balance = user.get("walletBalance", 0)
+    new_balance = balance + amount
+    
+    # Credit wallet
+    users_col.update_one({"_id": ObjectId(user["id"])}, {"$set": {"walletBalance": new_balance}})
+    
+    # Mark as used
+    db["redeem_codes"].update_one(
+        {"_id": code["_id"]},
+        {"$addToSet": {"usedBy": user["id"]}, "$inc": {"useCount": 1}}
+    )
+    
+    # Transaction record
+    transactions_col.insert_one({
+        "userId": user["id"],
+        "type": "CREDIT",
+        "amount": amount,
+        "description": f"Redeem code: {data.code.upper()}",
+        "referenceId": str(code["_id"]),
+        "balanceBefore": balance,
+        "balanceAfter": new_balance,
+        "createdAt": datetime.now(timezone.utc)
+    })
+    
+    notifications_col.insert_one({
+        "userId": user["id"],
+        "title": "🎁 Code Redeemed!",
+        "message": f"₹{amount} credited to your wallet via redeem code",
+        "type": "SUCCESS",
+        "isRead": False,
+        "createdAt": datetime.now(timezone.utc)
+    })
+    
+    return {"message": f"Code redeemed! ₹{amount} added to your wallet", "amount": amount, "newBalance": new_balance}
+
+@app.get("/api/player/wallet/topup-history")
+async def get_topup_history(user: dict = Depends(get_current_user)):
+    requests = list(db["topup_requests"].find({"userId": user["id"]}).sort("requestedAt", DESCENDING).limit(20))
+    return [serialize_doc(r) for r in requests]
+
+# ============== ADMIN TOPUP MANAGEMENT ==============
+@app.get("/api/admin/topup-requests")
+async def get_topup_requests(status: Optional[str] = None, admin: dict = Depends(get_admin_user)):
+    query = {}
+    if status:
+        query["status"] = status
+    requests = list(db["topup_requests"].find(query).sort("requestedAt", DESCENDING))
+    result = []
+    for req in requests:
+        player = users_col.find_one({"_id": ObjectId(req["userId"])}, {"passwordHash": 0})
+        result.append({
+            **serialize_doc(req),
+            "playerIgn": player.get("ign", "Unknown") if player else "Unknown",
+            "playerEmail": player.get("email", "") if player else ""
+        })
+    return result
+
+@app.put("/api/admin/topup-requests/{request_id}")
+async def process_topup_request(request_id: str, action: str, note: Optional[str] = None, admin: dict = Depends(get_admin_user)):
+    req = db["topup_requests"].find_one({"_id": ObjectId(request_id)})
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if req["status"] != "PENDING":
+        raise HTTPException(status_code=400, detail="Request already processed")
+    
+    if action == "APPROVED":
+        # Credit wallet
+        player = users_col.find_one({"_id": ObjectId(req["userId"])})
+        if player:
+            balance = player.get("walletBalance", 0)
+            new_balance = balance + req["amount"]
+            users_col.update_one({"_id": ObjectId(req["userId"])}, {"$set": {"walletBalance": new_balance}})
+            transactions_col.insert_one({
+                "userId": req["userId"],
+                "type": "CREDIT",
+                "amount": req["amount"],
+                "description": f"Wallet topup via UPI (UTR: {req['utrNumber']})",
+                "referenceId": request_id,
+                "balanceBefore": balance,
+                "balanceAfter": new_balance,
+                "createdAt": datetime.now(timezone.utc)
+            })
+            notifications_col.insert_one({
+                "userId": req["userId"],
+                "title": "✅ Wallet Topup Approved!",
+                "message": f"₹{req['amount']} has been added to your wallet",
+                "type": "SUCCESS",
+                "isRead": False,
+                "createdAt": datetime.now(timezone.utc)
+            })
+        db["topup_requests"].update_one({"_id": ObjectId(request_id)}, {"$set": {"status": "APPROVED", "processedBy": admin["id"], "processedAt": datetime.now(timezone.utc)}})
+    else:
+        notifications_col.insert_one({
+            "userId": req["userId"],
+            "title": "❌ Wallet Topup Rejected",
+            "message": f"Your topup of ₹{req['amount']} was rejected. {note or 'Please contact support.'}",
+            "type": "DANGER",
+            "isRead": False,
+            "createdAt": datetime.now(timezone.utc)
+        })
+        db["topup_requests"].update_one({"_id": ObjectId(request_id)}, {"$set": {"status": "REJECTED", "rejectionNote": note, "processedBy": admin["id"], "processedAt": datetime.now(timezone.utc)}})
+    
+    return {"message": f"Topup request {action.lower()}"}
+
+@app.get("/api/admin/payment-settings-full")
+async def get_full_payment_settings(admin: dict = Depends(get_admin_user)):
+    settings = db["settings"].find_one({"key": "payment_settings"})
+    if not settings:
+        return {"upiEnabled": True, "redeemEnabled": True, "razorpayEnabled": False, "upiId": "osglive@upi", "qrCodeUrl": "", "minTopup": 10, "maxTopup": 10000}
+    return serialize_doc(settings)
+
+@app.put("/api/admin/payment-settings")
+async def update_payment_settings(settings: dict, admin: dict = Depends(get_admin_user)):
+    settings["key"] = "payment_settings"
+    db["settings"].update_one({"key": "payment_settings"}, {"$set": settings}, upsert=True)
+    return {"message": "Payment settings updated"}
+
+@app.post("/api/admin/redeem-codes")
+async def create_redeem_code(
+    code: str, amount: float, maxUses: int = 1,
+    expiryHours: int = 24,
+    admin: dict = Depends(get_admin_user)
+):
+    existing = db["redeem_codes"].find_one({"code": code.upper()})
+    if existing:
+        raise HTTPException(status_code=400, detail="Code already exists")
+    db["redeem_codes"].insert_one({
+        "code": code.upper().strip(),
+        "amount": amount,
+        "maxUses": maxUses,
+        "useCount": 0,
+        "usedBy": [],
+        "isActive": True,
+        "expiresAt": datetime.now(timezone.utc) + timedelta(hours=expiryHours),
+        "createdBy": admin["id"],
+        "createdAt": datetime.now(timezone.utc)
+    })
+    return {"message": f"Redeem code {code.upper()} created for ₹{amount}"}
+
+@app.get("/api/admin/redeem-codes")
+async def list_redeem_codes(admin: dict = Depends(get_admin_user)):
+    codes = list(db["redeem_codes"].find().sort("createdAt", DESCENDING))
+    return [serialize_doc(c) for c in codes]
+
+@app.delete("/api/admin/redeem-codes/{code_id}")
+async def delete_redeem_code(code_id: str, admin: dict = Depends(get_admin_user)):
+    db["redeem_codes"].update_one({"_id": ObjectId(code_id)}, {"$set": {"isActive": False}})
+    return {"message": "Code deactivated"}
 
 # ============== TEAM ROUTES ==============
 @app.post("/api/teams")
@@ -2117,6 +2357,86 @@ async def seed_database():
             })
     
     return {"message": "Seed complete. Admin: admin@osglive.in / Admin@1234"}
+
+# ============== ADMIN APPEAL MANAGEMENT ==============
+@app.get("/api/admin/appeals")
+async def get_all_appeals(admin: dict = Depends(get_admin_user)):
+    """Get all bans that have pending appeals"""
+    bans_with_appeals = list(bans_col.find(
+        {"appealStatus": {"$in": ["PENDING", "APPROVED", "REJECTED"]}}
+    ).sort("appealedAt", DESCENDING))
+    
+    result = []
+    for ban in bans_with_appeals:
+        player = users_col.find_one(
+            {"_id": ObjectId(ban["userId"])},
+            {"passwordHash": 0}
+        )
+        result.append({
+            **serialize_doc(ban),
+            "player": {
+                "id": str(player["_id"]) if player else None,
+                "ign": player.get("ign", "Unknown") if player else "Unknown",
+                "ffUid": player.get("ffUid", "") if player else "",
+                "email": player.get("email", "") if player else "",
+                "fullName": player.get("fullName", "") if player else ""
+            }
+        })
+    
+    return result
+
+@app.put("/api/admin/appeals/{ban_id}")
+async def process_appeal(
+    ban_id: str,
+    action: str,  # "APPROVED" or "REJECTED"
+    note: Optional[str] = None,
+    admin: dict = Depends(get_admin_user)
+):
+    """Approve or reject a ban appeal"""
+    ban = bans_col.find_one({"_id": ObjectId(ban_id)})
+    if not ban:
+        raise HTTPException(status_code=404, detail="Ban not found")
+    
+    if ban.get("appealStatus") != "PENDING":
+        raise HTTPException(status_code=400, detail="No pending appeal for this ban")
+    
+    if action not in ["APPROVED", "REJECTED"]:
+        raise HTTPException(status_code=400, detail="Action must be APPROVED or REJECTED")
+    
+    update_data = {
+        "appealStatus": action,
+        "resolvedAt": datetime.now(timezone.utc),
+        "resolvedBy": admin["id"]
+    }
+    
+    if action == "APPROVED":
+        # Lift the ban
+        update_data["isActive"] = False
+        message = "Your ban appeal has been approved. Your account is now active."
+        notif_type = "SUCCESS"
+    else:
+        message = f"Your ban appeal has been rejected. {note or ''}"
+        notif_type = "DANGER"
+    
+    bans_col.update_one({"_id": ObjectId(ban_id)}, {"$set": update_data})
+    
+    # Notify player
+    notifications_col.insert_one({
+        "userId": ban["userId"],
+        "title": f"Appeal {action.title()}",
+        "message": message,
+        "type": notif_type,
+        "isRead": False,
+        "link": "/dashboard/bans",
+        "createdAt": datetime.now(timezone.utc)
+    })
+    
+    return {"message": f"Appeal {action.lower()} successfully"}
+
+@app.get("/api/admin/appeals/count")
+async def get_appeal_count(admin: dict = Depends(get_admin_user)):
+    count = bans_col.count_documents({"appealStatus": "PENDING"})
+    return {"pendingAppeals": count}
 
 # Admin: clear rate limits (useful when testing)
 @app.delete("/api/admin/rate-limits")
