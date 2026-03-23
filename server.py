@@ -69,8 +69,14 @@ SECRET_KEY = os.environ.get("JWT_SECRET", "osg-live-super-secret-key-2024")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 7
 
-# Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Password hashing - suppress bcrypt version warning
+import warnings
+warnings.filterwarnings("ignore", ".*error reading bcrypt version.*")
+warnings.filterwarnings("ignore", ".*AttributeError.*bcrypt.*")
+try:
+    pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+except Exception:
+    pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # SSE Clients
 sse_clients: Dict[str, List[asyncio.Queue]] = {}
@@ -484,15 +490,21 @@ async def login(credentials: UserLogin, request: Request):
             raise HTTPException(status_code=403, detail="Account permanently banned")
         else:
             expires = active_ban.get("expiresAt")
+            if expires and expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
             exp_str = expires.isoformat() if expires else "indefinitely"
             raise HTTPException(status_code=403, detail=f"Account banned until {exp_str}")
     
-    # Update login log
-    login_logs_col.update_one(
+    # Update login log - find latest failed log and mark success
+    latest_log = login_logs_col.find_one(
         {"userId": str(user["_id"]), "ip": ip, "success": False},
-        {"$set": {"success": True}},
         sort=[("createdAt", DESCENDING)]
     )
+    if latest_log:
+        login_logs_col.update_one(
+            {"_id": latest_log["_id"]},
+            {"$set": {"success": True}}
+        )
     
     # Update user
     users_col.update_one(
