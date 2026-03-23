@@ -318,7 +318,6 @@ def check_rate_limit(key: str, limit: int = 5, window_minutes: int = 15) -> bool
     
     if entry:
         try:
-            # Fix: MongoDB may return naive datetime - make it timezone-aware
             reset_at = entry["resetAt"]
             if reset_at.tzinfo is None:
                 reset_at = reset_at.replace(tzinfo=timezone.utc)
@@ -328,12 +327,12 @@ def check_rate_limit(key: str, limit: int = 5, window_minutes: int = 15) -> bool
                     return False
                 rate_limits_col.update_one({"key": key}, {"$inc": {"count": 1}})
             else:
+                # Window expired - reset count
                 rate_limits_col.update_one(
                     {"key": key},
                     {"$set": {"count": 1, "resetAt": now + timedelta(minutes=window_minutes)}}
                 )
         except Exception:
-            # If any comparison fails, reset the entry
             rate_limits_col.update_one(
                 {"key": key},
                 {"$set": {"count": 1, "resetAt": now + timedelta(minutes=window_minutes)}}
@@ -346,6 +345,10 @@ def check_rate_limit(key: str, limit: int = 5, window_minutes: int = 15) -> bool
             "createdAt": now
         })
     return True
+
+def clear_rate_limit(key: str):
+    """Clear rate limit after successful action"""
+    rate_limits_col.delete_one({"key": key})
 
 # ============== AUTH ROUTES ==============
 @app.post("/api/auth/register")
@@ -447,7 +450,7 @@ async def login(credentials: UserLogin, request: Request):
         raise HTTPException(status_code=403, detail="Access denied from this IP")
     
     # Check rate limit
-    if not check_rate_limit(f"login:{ip}"):
+    if not check_rate_limit(f"login:{ip}", limit=10, window_minutes=15):
         raise HTTPException(status_code=429, detail="Too many login attempts. Please wait 15 minutes.")
     
     # Find user
@@ -495,6 +498,9 @@ async def login(credentials: UserLogin, request: Request):
             exp_str = expires.isoformat() if expires else "indefinitely"
             raise HTTPException(status_code=403, detail=f"Account banned until {exp_str}")
     
+    # Clear rate limit on successful login
+    clear_rate_limit(f"login:{ip}")
+    
     # Update login log - find latest failed log and mark success
     latest_log = login_logs_col.find_one(
         {"userId": str(user["_id"]), "ip": ip, "success": False},
@@ -534,8 +540,8 @@ async def login(credentials: UserLogin, request: Request):
 async def admin_login(credentials: UserLogin, request: Request):
     ip = get_client_ip(request)
     
-    if not check_rate_limit(f"admin_login:{ip}", limit=3):
-        raise HTTPException(status_code=429, detail="Too many attempts")
+    if not check_rate_limit(f"admin_login:{ip}", limit=10, window_minutes=30):
+        raise HTTPException(status_code=429, detail="Too many attempts. Please wait 30 minutes.")
     
     user = users_col.find_one({
         "$or": [{"email": credentials.identifier}, {"mobile": credentials.identifier}],
@@ -549,6 +555,9 @@ async def admin_login(credentials: UserLogin, request: Request):
         {"sub": str(user["_id"]), "role": "ADMIN"},
         expires_delta=timedelta(hours=4)
     )
+    
+    # Clear rate limit on successful login
+    clear_rate_limit(f"admin_login:{ip}")
     
     return {
         "token": token,
@@ -1469,24 +1478,47 @@ async def appeal_ban(ban_id: str, appeal_text: str, user: dict = Depends(get_cur
     if not ban:
         raise HTTPException(status_code=404, detail="Ban not found")
     
-    if ban["banType"] not in ["THREE_DAYS", "SEVEN_DAYS"]:
-        raise HTTPException(status_code=400, detail="This ban type cannot be appealed")
+    # Allow appeals for all ban types except PERMANENT
+    if ban["banType"] == "PERMANENT":
+        raise HTTPException(status_code=400, detail="Permanent bans cannot be appealed")
     
-    if ban.get("appealStatus"):
-        raise HTTPException(status_code=400, detail="Appeal already submitted")
+    if ban.get("appealStatus") == "PENDING":
+        raise HTTPException(status_code=400, detail="Appeal already submitted and pending review")
+    
+    if ban.get("appealStatus") == "REJECTED":
+        raise HTTPException(status_code=400, detail="Your previous appeal was rejected")
+    
+    if not ban.get("isActive"):
+        raise HTTPException(status_code=400, detail="This ban is no longer active")
+    
+    if not appeal_text or len(appeal_text.strip()) < 10:
+        raise HTTPException(status_code=400, detail="Appeal text must be at least 10 characters")
     
     bans_col.update_one(
         {"_id": ObjectId(ban_id)},
         {
             "$set": {
-                "appealText": appeal_text,
+                "appealText": appeal_text.strip(),
                 "appealStatus": "PENDING",
                 "appealedAt": datetime.now(timezone.utc)
             }
         }
     )
     
-    return {"message": "Appeal submitted"}
+    # Notify admin
+    admin = users_col.find_one({"role": "ADMIN"})
+    if admin:
+        notifications_col.insert_one({
+            "userId": str(admin["_id"]),
+            "title": "Ban Appeal Received",
+            "message": f"Player {user.get('ign', 'Unknown')} has appealed their {ban['banType']} ban",
+            "type": "INFO",
+            "isRead": False,
+            "link": f"/admin/players/{user['id']}",
+            "createdAt": datetime.now(timezone.utc)
+        })
+    
+    return {"message": "Appeal submitted successfully. Admin will review within 24 hours."}
 
 # ============== ADMIN ROUTES ==============
 @app.get("/api/admin/dashboard")
@@ -2085,6 +2117,12 @@ async def seed_database():
             })
     
     return {"message": "Seed complete. Admin: admin@osglive.in / Admin@1234"}
+
+# Admin: clear rate limits (useful when testing)
+@app.delete("/api/admin/rate-limits")
+async def clear_all_rate_limits(admin: dict = Depends(get_admin_user)):
+    rate_limits_col.delete_many({})
+    return {"message": "All rate limits cleared"}
 
 # Health check
 @app.get("/api/health")
