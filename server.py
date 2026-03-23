@@ -2134,6 +2134,13 @@ async def ban_player(player_id: str, data: BanCreate, admin: dict = Depends(get_
     
     bans_col.insert_one(ban_doc)
     
+    # Set user isActive=False for all bans except MATCH_TERMINATION
+    if data.banType != "MATCH_TERMINATION":
+        users_col.update_one(
+            {"_id": ObjectId(player_id)},
+            {"$set": {"isActive": False}}
+        )
+    
     # Create notification
     notifications_col.insert_one({
         "userId": player_id,
@@ -2154,6 +2161,12 @@ async def unban_player(player_id: str, admin: dict = Depends(get_admin_user)):
     bans_col.update_many(
         {"userId": player_id, "isActive": True},
         {"$set": {"isActive": False, "resolvedAt": datetime.now(timezone.utc), "resolvedBy": admin["id"]}}
+    )
+    
+    # Restore user account
+    users_col.update_one(
+        {"_id": ObjectId(player_id)},
+        {"$set": {"isActive": True}}
     )
     
     # Remove IP bans
