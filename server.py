@@ -2486,6 +2486,143 @@ async def seed_database():
     
     return {"message": "Seed complete. Admin: admin@osglive.in / Admin@1234"}
 
+@app.post("/api/seed/test-tournament")
+async def seed_test_tournament():
+    """Create a complete test tournament with 12 fake teams and match results for testing"""
+    import random
+
+    team_names = [
+        "TAMIZH TITANS", "X PR!ME", "SUNNY PLAYZE", "REX E ESPORTS",
+        "TEAM MONSTERS", "TEAM KYT", "TPL ESPORTS", "TEAM HARRY",
+        "BORN2BOTZ", "HIGHSPEED FF", "WARRIORS", "OSG ESPORTS"
+    ]
+
+    # Create or get test tournament
+    existing = tournaments_col.find_one({"name": "OSG Test Tournament"})
+    if existing:
+        # Clean up old test data
+        old_id = str(existing["_id"])
+        old_matches = list(matches_col.find({"tournamentId": old_id}))
+        for m in old_matches:
+            match_results_col.delete_many({"matchId": str(m["_id"])})
+        matches_col.delete_many({"tournamentId": old_id})
+        old_regs = list(registrations_col.find({"tournamentId": old_id}))
+        for r in old_regs:
+            teams_col.delete_one({"_id": ObjectId(r["teamId"])})
+        registrations_col.delete_many({"tournamentId": old_id})
+        tournaments_col.delete_one({"_id": existing["_id"]})
+
+    # Create tournament
+    tournament = tournaments_col.insert_one({
+        "name": "OSG Test Tournament",
+        "map": "BERMUDA",
+        "scheduledAt": datetime.now(timezone.utc),
+        "entryFee": 50,
+        "maxTeams": 12,
+        "playersPerTeam": 4,
+        "prizePool": {"1": 500, "2": 300, "3": 200},
+        "perKillPrize": 5,
+        "rules": "Test tournament - ignore",
+        "status": "LIVE",
+        "roomId": "TEST123",
+        "roomPassword": "osg123",
+        "roomReleasedAt": datetime.now(timezone.utc),
+        "totalSlots": 12,
+        "filledSlots": 12,
+        "createdAt": datetime.now(timezone.utc),
+        "updatedAt": datetime.now(timezone.utc)
+    })
+    t_id = str(tournament.inserted_id)
+
+    # Create 6 matches
+    match_ids = []
+    maps = ["BERMUDA", "PURGATORY", "KALAHARI", "ALPHINE", "NEXTERRA", "SOLARA"]
+    for i in range(1, 7):
+        m = matches_col.insert_one({
+            "tournamentId": t_id,
+            "matchNumber": i,
+            "mapName": maps[i-1],
+            "status": "COMPLETED",
+            "playedAt": datetime.now(timezone.utc),
+            "createdAt": datetime.now(timezone.utc)
+        })
+        match_ids.append(str(m.inserted_id))
+
+    # Create 12 fake teams and register them
+    team_ids = []
+    for idx, name in enumerate(team_names):
+        # Check if team exists
+        existing_team = teams_col.find_one({"name": name})
+        if existing_team:
+            team_ids.append(str(existing_team["_id"]))
+            t_doc = existing_team
+        else:
+            t_doc = teams_col.insert_one({
+                "name": name,
+                "captainId": "test_captain",
+                "members": ["test_member"],
+                "isActive": True,
+                "createdAt": datetime.now(timezone.utc),
+                "updatedAt": datetime.now(timezone.utc)
+            })
+            team_ids.append(str(t_doc.inserted_id))
+
+        # Register team
+        registrations_col.update_one(
+            {"tournamentId": t_id, "teamId": team_ids[-1]},
+            {"$set": {
+                "tournamentId": t_id,
+                "teamId": team_ids[-1],
+                "slotNumber": idx + 1,
+                "paymentStatus": "PAID",
+                "amountPaid": 50,
+                "registeredAt": datetime.now(timezone.utc),
+                "confirmedAt": datetime.now(timezone.utc)
+            }},
+            upsert=True
+        )
+
+    # Generate realistic random match results for all 6 matches
+    results_summary = []
+    for match_num, match_id in enumerate(match_ids):
+        # Random placement for each team (shuffle 1-12)
+        placements = list(range(1, 13))
+        random.shuffle(placements)
+
+        for team_idx, team_id in enumerate(team_ids):
+            placement = placements[team_idx]
+            kills = random.randint(0, 8) if placement <= 6 else random.randint(0, 4)
+            if placement == 1:
+                kills = random.randint(3, 12)  # Winner usually has more kills
+
+            pts = calculate_match_points(kills, placement)
+
+            match_results_col.update_one(
+                {"matchId": match_id, "teamId": team_id},
+                {"$set": {
+                    "matchId": match_id,
+                    "teamId": team_id,
+                    "kills": kills,
+                    "placement": placement,
+                    "booyah": placement == 1,
+                    "placementPoints": pts["placementPoints"],
+                    "killPoints": pts["killPoints"],
+                    "totalPoints": pts["totalPoints"]
+                }},
+                upsert=True
+            )
+
+        results_summary.append(f"Match {match_num+1}: results saved")
+
+    return {
+        "message": "Test tournament created with 12 teams and 6 matches of results!",
+        "tournamentId": t_id,
+        "teamsCreated": len(team_ids),
+        "matchesCreated": len(match_ids),
+        "note": "Go to Admin → Tournaments → OSG Test Tournament → Standings to see results",
+        "adminUrl": "/admin/tournaments/" + t_id
+    }
+
 # ============== ADMIN APPEAL MANAGEMENT ==============
 @app.get("/api/admin/appeals")
 async def get_all_appeals(admin: dict = Depends(get_admin_user)):
