@@ -1665,37 +1665,87 @@ async def razorpay_webhook(request: Request):
 # ============== LEADERBOARD ROUTES ==============
 @app.get("/api/leaderboard")
 async def get_leaderboard(period: str = "all"):
+    # Filter by period
+    match_filter = {}
+    if period == "weekly":
+        week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+        # Get match IDs from last week
+        recent_matches = list(matches_col.find(
+            {"playedAt": {"$gte": week_ago}},
+            {"_id": 1}
+        ))
+        match_ids = [str(m["_id"]) for m in recent_matches]
+        if match_ids:
+            match_filter = {"matchId": {"$in": match_ids}}
+        else:
+            return []
+    elif period == "monthly":
+        month_ago = datetime.now(timezone.utc) - timedelta(days=30)
+        recent_matches = list(matches_col.find(
+            {"playedAt": {"$gte": month_ago}},
+            {"_id": 1}
+        ))
+        match_ids = [str(m["_id"]) for m in recent_matches]
+        if match_ids:
+            match_filter = {"matchId": {"$in": match_ids}}
+        else:
+            return []
+
     pipeline = [
+        {"$match": match_filter} if match_filter else {"$match": {}},
         {"$group": {
             "_id": "$teamId",
             "totalKills": {"$sum": "$kills"},
             "totalWins": {"$sum": {"$cond": [{"$eq": ["$placement", 1]}, 1, 0]}},
+            "totalPlacementPts": {"$sum": "$placementPoints"},
+            "totalKillPts": {"$sum": "$killPoints"},
             "totalPoints": {"$sum": "$totalPoints"},
             "matchesPlayed": {"$sum": 1}
         }},
-        {"$sort": {"totalPoints": -1}},
+        {"$sort": {"totalPoints": -1, "totalKills": -1}},
         {"$limit": 100}
     ]
-    
+
     results = list(match_results_col.aggregate(pipeline))
-    
+
     leaderboard = []
     for i, entry in enumerate(results):
-        team = teams_col.find_one({"_id": ObjectId(entry["_id"])})
+        if not entry["_id"]:
+            continue
+        try:
+            team = teams_col.find_one({"_id": ObjectId(entry["_id"])})
+        except Exception:
+            continue
         if team:
-            # Get captain
             captain = users_col.find_one({"_id": ObjectId(team["captainId"])})
+            # Get total earnings from prizes
+            earnings = transactions_col.aggregate([
+                {"$match": {"userId": team["captainId"], "type": "PRIZE"}},
+                {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
+            ])
+            earnings_list = list(earnings)
+            total_earnings = earnings_list[0]["total"] if earnings_list else 0
+
             leaderboard.append({
                 "rank": i + 1,
                 "teamName": team["name"],
                 "captainIgn": captain["ign"] if captain else "Unknown",
                 "totalKills": entry["totalKills"],
                 "totalWins": entry["totalWins"],
+                "totalPlacementPts": entry["totalPlacementPts"],
+                "totalKillPts": entry["totalKillPts"],
                 "totalPoints": entry["totalPoints"],
-                "matchesPlayed": entry["matchesPlayed"]
+                "matchesPlayed": entry["matchesPlayed"],
+                "totalEarnings": total_earnings
             })
-    
+
     return leaderboard
+
+@app.get("/api/leaderboard/tournament/{tournament_id}")
+async def get_tournament_leaderboard(tournament_id: str):
+    """Public tournament standings"""
+    standings = await get_tournament_standings(tournament_id)
+    return standings
 
 # ============== NOTIFICATIONS ==============
 @app.get("/api/notifications")
@@ -1959,6 +2009,55 @@ async def release_room(tournament_id: str, admin: dict = Depends(get_admin_user)
     print(f"[EMAIL] Room ID released notifications sent")
     
     return {"message": "Room details released"}
+
+@app.get("/api/admin/tournaments/{tournament_id}/matches")
+async def get_tournament_matches(tournament_id: str, admin: dict = Depends(get_admin_user)):
+    """Get all matches with their current results for a tournament"""
+    matches = list(matches_col.find(
+        {"tournamentId": tournament_id}
+    ).sort("matchNumber", ASCENDING))
+    
+    result = []
+    for match in matches:
+        match_id = str(match["_id"])
+        results = list(match_results_col.find({"matchId": match_id}))
+        
+        # Get registered teams for this tournament
+        registrations = list(registrations_col.find({
+            "tournamentId": tournament_id,
+            "paymentStatus": "PAID"
+        }))
+        
+        teams_data = []
+        for reg in registrations:
+            team = teams_col.find_one({"_id": ObjectId(reg["teamId"])})
+            if team:
+                # Find existing result for this team
+                existing = next((r for r in results if r["teamId"] == str(team["_id"])), None)
+                teams_data.append({
+                    "teamId": str(team["_id"]),
+                    "teamName": team["name"],
+                    "slotNumber": reg["slotNumber"],
+                    "kills": existing["kills"] if existing else 0,
+                    "placement": existing["placement"] if existing else 0,
+                    "booyah": existing.get("booyah", False) if existing else False,
+                    "placementPoints": existing["placementPoints"] if existing else 0,
+                    "killPoints": existing["killPoints"] if existing else 0,
+                    "totalPoints": existing["totalPoints"] if existing else 0,
+                })
+        
+        # Sort by slot number
+        teams_data.sort(key=lambda x: x["slotNumber"])
+        
+        result.append({
+            "id": match_id,
+            "matchNumber": match["matchNumber"],
+            "mapName": match.get("mapName", ""),
+            "status": match["status"],
+            "teams": teams_data
+        })
+    
+    return result
 
 @app.post("/api/admin/matches/{match_id}/results")
 async def save_match_results(match_id: str, results: List[MatchResultEntry], admin: dict = Depends(get_admin_user)):
