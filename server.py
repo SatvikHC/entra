@@ -195,6 +195,14 @@ class TeamCreate(BaseModel):
 class TeamInvite(BaseModel):
     ffUid: str
 
+class TournamentMode(str, Enum):
+    BR = "BR"
+    CLASH_SQUAD_1v1 = "CS_1v1"
+    CLASH_SQUAD_2v2 = "CS_2v2"
+    CLASH_SQUAD_4v4 = "CS_4v4"
+    LONE_WOLF_1v1 = "LW_1v1"
+    LONE_WOLF_2v2 = "LW_2v2"
+
 class TournamentCreate(BaseModel):
     name: str
     map: MapType
@@ -206,6 +214,8 @@ class TournamentCreate(BaseModel):
     perKillPrize: float = 0
     rules: str
     youtubeUrl: Optional[str] = None
+    mode: Optional[str] = "BR"
+    description: Optional[str] = None
 
 class TournamentUpdate(BaseModel):
     name: Optional[str] = None
@@ -1351,15 +1361,22 @@ async def list_tournaments(
     status: Optional[str] = None,
     map: Optional[str] = None,
     minFee: Optional[float] = None,
-    maxFee: Optional[float] = None
+    maxFee: Optional[float] = None,
+    mode: Optional[str] = None
 ):
     query = {}
     
+    # Default: show all non-DRAFT tournaments
     if status and status != "all":
         query["status"] = status
+    else:
+        query["status"] = {"$ne": "DRAFT"}
     
     if map:
         query["map"] = map
+    
+    if mode:
+        query["mode"] = mode
     
     if minFee is not None or maxFee is not None:
         query["entryFee"] = {}
@@ -1368,7 +1385,7 @@ async def list_tournaments(
         if maxFee is not None:
             query["entryFee"]["$lte"] = maxFee
     
-    tournaments = list(tournaments_col.find(query).sort("scheduledAt", DESCENDING))
+    tournaments = list(tournaments_col.find(query).sort("scheduledAt", ASCENDING))
     return [serialize_doc(t) for t in tournaments]
 
 @app.get("/api/tournaments/featured")
@@ -1490,13 +1507,12 @@ async def get_room_details(tournament_id: str, user: dict = Depends(get_current_
 async def check_eligibility(tournament_id: str, user: dict = Depends(get_current_user)):
     issues = []
     
-    # Check email verified
-    if not user.get("emailVerified"):
-        issues.append({"code": "EMAIL_NOT_VERIFIED", "message": "Email not verified"})
-    
-    # Check mobile verified
-    if not user.get("mobileVerified"):
-        issues.append({"code": "MOBILE_NOT_VERIFIED", "message": "Mobile not verified"})
+    # Check verification requirements from platform settings
+    p_settings = db["platform_settings"].find_one({"key": "main"}) or {}
+    if p_settings.get("emailVerifyRequired", False) and not user.get("emailVerified"):
+        issues.append({"code": "EMAIL_NOT_VERIFIED", "message": "Email verification required"})
+    if p_settings.get("mobileVerifyRequired", False) and not user.get("mobileVerified"):
+        issues.append({"code": "MOBILE_NOT_VERIFIED", "message": "Mobile verification required"})
     
     # Check team
     team = teams_col.find_one({"members": user["id"]})
@@ -2096,17 +2112,26 @@ async def generate_cup_finals(cup_id: str, admin: dict = Depends(get_admin_user)
 
 @app.post("/api/admin/tournaments")
 async def create_tournament(data: TournamentCreate, admin: dict = Depends(get_admin_user)):
+    # Determine players per team based on mode
+    mode = data.mode or "BR"
+    players_map = {
+        "BR": 4, "CS_1v1": 1, "CS_2v2": 2, "CS_4v4": 4, "LW_1v1": 1, "LW_2v2": 2
+    }
+    players_per_team = players_map.get(mode, data.playersPerTeam)
+    
     tournament_doc = {
         "name": data.name,
         "map": data.map,
         "scheduledAt": datetime.fromisoformat(data.scheduledAt.replace("Z", "+00:00")),
         "entryFee": data.entryFee,
         "maxTeams": data.maxTeams,
-        "playersPerTeam": data.playersPerTeam,
+        "playersPerTeam": players_per_team,
         "prizePool": data.prizePool,
         "perKillPrize": data.perKillPrize,
         "rules": data.rules,
         "youtubeUrl": data.youtubeUrl,
+        "mode": mode,
+        "description": data.description,
         "status": "DRAFT",
         "totalSlots": data.maxTeams,
         "filledSlots": 0,
@@ -3076,6 +3101,34 @@ async def get_appeal_count(admin: dict = Depends(get_admin_user)):
 async def clear_all_rate_limits(admin: dict = Depends(get_admin_user)):
     rate_limits_col.delete_many({})
     return {"message": "All rate limits cleared"}
+
+# ============== PLATFORM SETTINGS ==============
+@app.get("/api/admin/platform-settings")
+async def get_platform_settings(admin: dict = Depends(get_admin_user)):
+    settings = db["platform_settings"].find_one({"key": "main"})
+    if not settings:
+        return {"emailVerifyRequired": False, "mobileVerifyRequired": False, "maintenanceMode": False, "discordUrl": "https://discord.gg/bpXVqbBN"}
+    s = serialize_doc(settings)
+    return s
+
+@app.put("/api/admin/platform-settings")
+async def update_platform_settings(data: dict, admin: dict = Depends(get_admin_user)):
+    data["key"] = "main"
+    data["updatedAt"] = datetime.now(timezone.utc)
+    db["platform_settings"].update_one({"key": "main"}, {"$set": data}, upsert=True)
+    return {"message": "Settings saved"}
+
+@app.get("/api/platform-settings")
+async def get_public_platform_settings():
+    """Public endpoint — no auth needed"""
+    settings = db["platform_settings"].find_one({"key": "main"})
+    if not settings:
+        return {"emailVerifyRequired": False, "mobileVerifyRequired": False, "discordUrl": "https://discord.gg/bpXVqbBN"}
+    return {
+        "emailVerifyRequired": settings.get("emailVerifyRequired", False),
+        "mobileVerifyRequired": settings.get("mobileVerifyRequired", False),
+        "discordUrl": settings.get("discordUrl", "https://discord.gg/bpXVqbBN")
+    }
 
 # Health check
 @app.get("/api/health")
