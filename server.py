@@ -154,6 +154,7 @@ class MapType(str, Enum):
     ALPHINE = "ALPHINE"
     NEXTERRA = "NEXTERRA"
     SOLARA = "SOLARA"
+    IRON_CAGE = "IRON_CAGE"  # Lone Wolf only
 
 # ============== MODELS ==============
 class UserRegister(BaseModel):
@@ -219,7 +220,7 @@ class TournamentCreate(BaseModel):
 
 class TournamentUpdate(BaseModel):
     name: Optional[str] = None
-    map: Optional[MapType] = None
+    map: Optional[str] = None  # Allow any string including IRON_CAGE
     scheduledAt: Optional[str] = None
     entryFee: Optional[float] = None
     prizePool: Optional[Dict[str, float]] = None
@@ -923,12 +924,14 @@ async def get_wallet(user: dict = Depends(get_current_user)):
 @app.post("/api/player/withdrawal")
 async def create_withdrawal(data: WithdrawalCreate, user: dict = Depends(get_current_user)):
     balance = user.get("walletBalance", 0)
-    
-    if data.amount > balance:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
+    PLATFORM_FEE = 5.0  # Always ₹5 platform fee
     
     if data.amount < 50:
         raise HTTPException(status_code=400, detail="Minimum withdrawal is ₹50")
+    
+    total_deduct = data.amount + PLATFORM_FEE
+    if total_deduct > balance:
+        raise HTTPException(status_code=400, detail=f"Insufficient balance. Need ₹{total_deduct} (₹{data.amount} + ₹{PLATFORM_FEE} fee)")
     
     # Check pending withdrawals
     pending = withdrawals_col.find_one({
@@ -948,8 +951,8 @@ async def create_withdrawal(data: WithdrawalCreate, user: dict = Depends(get_cur
     }
     result = withdrawals_col.insert_one(withdrawal_doc)
     
-    # Deduct from wallet
-    new_balance = balance - data.amount
+    # Deduct from wallet (amount + platform fee)
+    new_balance = balance - total_deduct
     users_col.update_one(
         {"_id": ObjectId(user["id"])},
         {"$set": {"walletBalance": new_balance}}
@@ -960,7 +963,7 @@ async def create_withdrawal(data: WithdrawalCreate, user: dict = Depends(get_cur
         "userId": user["id"],
         "type": "WITHDRAWAL",
         "amount": -data.amount,
-        "description": f"Withdrawal request to {data.upiId}",
+        "description": f"Withdrawal ₹{data.amount} to {data.upiId} (₹{PLATFORM_FEE} platform fee deducted)",
         "referenceId": str(result.inserted_id),
         "balanceBefore": balance,
         "balanceAfter": new_balance,
@@ -1366,16 +1369,20 @@ async def list_tournaments(
 ):
     query = {}
     
-    # Default: show all non-DRAFT tournaments
-    if status and status != "all":
+    # Always exclude DRAFT from public listing; filter by status if provided
+    if status and status not in ("all", "ALL", ""):
         query["status"] = status
+        # Still exclude DRAFT if someone sends status=DRAFT (shouldn't happen)
+        if status == "DRAFT":
+            return []
     else:
-        query["status"] = {"$ne": "DRAFT"}
+        # Show everything except DRAFT
+        query["status"] = {"$nin": ["DRAFT"]}
     
-    if map:
+    if map and map != "all":
         query["map"] = map
     
-    if mode:
+    if mode and mode != "all":
         query["mode"] = mode
     
     if minFee is not None or maxFee is not None:
@@ -1385,7 +1392,10 @@ async def list_tournaments(
         if maxFee is not None:
             query["entryFee"]["$lte"] = maxFee
     
-    tournaments = list(tournaments_col.find(query).sort("scheduledAt", ASCENDING))
+    # Exclude cup qualifier sub-tournaments from main listing
+    # (cup qualifiers have cupId set — show them only via cup page)
+    # Actually show them all for now
+    tournaments = list(tournaments_col.find(query).sort([("status", ASCENDING), ("scheduledAt", ASCENDING)]))
     return [serialize_doc(t) for t in tournaments]
 
 @app.get("/api/tournaments/featured")
@@ -1514,12 +1524,28 @@ async def check_eligibility(tournament_id: str, user: dict = Depends(get_current
     if p_settings.get("mobileVerifyRequired", False) and not user.get("mobileVerified"):
         issues.append({"code": "MOBILE_NOT_VERIFIED", "message": "Mobile verification required"})
     
-    # Check team
+    # Check team based on tournament mode
     team = teams_col.find_one({"members": user["id"]})
-    if not team:
-        issues.append({"code": "NO_TEAM", "message": "Not in a team"})
-    elif len(team.get("members", [])) < 4:
-        issues.append({"code": "TEAM_INCOMPLETE", "message": "Team needs 4 members"})
+    t_mode = tournament.get("mode", "BR") if tournament else "BR"
+    players_needed = tournament.get("playersPerTeam", 4) if tournament else 4
+    
+    solo_modes = ["CS_1v1", "LW_1v1"]
+    duo_modes = ["CS_2v2", "LW_2v2"]
+    
+    if t_mode in solo_modes:
+        # Solo — no team needed, player registers individually
+        pass
+    elif t_mode in duo_modes:
+        if not team:
+            issues.append({"code": "NO_TEAM", "message": "Need a team of 2 for this mode"})
+        elif len(team.get("members", [])) < 2:
+            issues.append({"code": "TEAM_INCOMPLETE", "message": f"Team needs {players_needed} members"})
+    else:
+        # BR and CS_4v4 — full squad of 4
+        if not team:
+            issues.append({"code": "NO_TEAM", "message": "Not in a team"})
+        elif len(team.get("members", [])) < players_needed:
+            issues.append({"code": "TEAM_INCOMPLETE", "message": f"Team needs {players_needed} members"})
     
     # Check active ban
     active_ban = bans_col.find_one({
@@ -1583,23 +1609,64 @@ async def create_registration(tournament_id: str, payment_method: str, user: dic
     }
     
     if payment_method == "wallet":
-        # Check wallet balance
-        if user.get("walletBalance", 0) < tournament["entryFee"]:
-            raise HTTPException(status_code=400, detail="Insufficient wallet balance")
+        # Entry fee split equally among team members
+        t_mode = tournament.get("mode", "BR")
+        solo_modes = ["CS_1v1", "LW_1v1"]
+        duo_modes = ["CS_2v2", "LW_2v2"]
         
-        # Deduct from wallet
-        new_balance = user["walletBalance"] - tournament["entryFee"]
-        users_col.update_one(
-            {"_id": ObjectId(user["id"])},
-            {"$set": {"walletBalance": new_balance}}
-        )
+        if t_mode in solo_modes:
+            players_count = 1
+        elif t_mode in duo_modes:
+            players_count = 2
+        else:
+            players_count = 4
         
-        # Create transaction
+        per_player_fee = round(tournament["entryFee"] / players_count, 2)
+        
+        # Deduct from each team member
+        current_team = teams_col.find_one({"members": user["id"]}) if t_mode not in solo_modes else None
+        members_to_charge = [user["id"]] if t_mode in solo_modes else (current_team.get("members", [user["id"]]) if current_team else [user["id"]])
+        
+        # Check all members have enough balance
+        for member_id in members_to_charge:
+            member = users_col.find_one({"_id": ObjectId(member_id)})
+            if member and member.get("walletBalance", 0) < per_player_fee:
+                raise HTTPException(status_code=400, detail=f"Insufficient balance for {member.get('ign','member')} (needs ₹{per_player_fee})")
+        
+        # Charge each member
+        for member_id in members_to_charge:
+            member = users_col.find_one({"_id": ObjectId(member_id)})
+            if member:
+                new_bal = member.get("walletBalance", 0) - per_player_fee
+                users_col.update_one({"_id": ObjectId(member_id)}, {"$set": {"walletBalance": new_bal}})
+                transactions_col.insert_one({
+                    "userId": member_id,
+                    "type": "DEBIT",
+                    "amount": -per_player_fee,
+                    "description": f"Tournament: {tournament['name']} (₹{per_player_fee}/player)",
+                    "tournamentId": tournament_id,
+                    "balanceBefore": member.get("walletBalance", 0),
+                    "balanceAfter": new_bal,
+                    "createdAt": datetime.now(timezone.utc)
+                })
+        
+        # Use user's balance for reg_doc tracking
+        new_balance = user.get("walletBalance", 0) - per_player_fee
+        users_col.update_one({"_id": ObjectId(user["id"])}, {"$set": {"walletBalance": new_balance}})
+        
+        # Dummy transaction (already recorded per member above, skip duplicate)
+        if not current_team or user["id"] == members_to_charge[0]:
+            pass  # already recorded above
+        
+        # Set amount paid on registration = full entry fee
+        reg_doc["amountPaid"] = tournament["entryFee"]
+        
+        # Create transaction — kept for backward compat
         transactions_col.insert_one({
             "userId": user["id"],
             "type": "DEBIT",
             "amount": -tournament["entryFee"],
-            "description": f"Tournament registration: {tournament['name']}",
+            "description": f"Tournament registration: {tournament['name']} (₹{per_player_fee}×{players_count})",
             "tournamentId": tournament_id,
             "balanceBefore": user["walletBalance"],
             "balanceAfter": new_balance,
@@ -2112,19 +2179,32 @@ async def generate_cup_finals(cup_id: str, admin: dict = Depends(get_admin_user)
 
 @app.post("/api/admin/tournaments")
 async def create_tournament(data: TournamentCreate, admin: dict = Depends(get_admin_user)):
-    # Determine players per team based on mode
+    # Determine players per team and mode constraints
     mode = data.mode or "BR"
     players_map = {
-        "BR": 4, "CS_1v1": 1, "CS_2v2": 2, "CS_4v4": 4, "LW_1v1": 1, "LW_2v2": 2
+        "BR": 4, "CS_4v4": 4, "CS_2v2": 2, "CS_1v1": 1, "LW_1v1": 1, "LW_2v2": 2
     }
     players_per_team = players_map.get(mode, data.playersPerTeam)
+    
+    # Override map for Lone Wolf (Iron Cage only)
+    tournament_map = data.map
+    if mode in ["LW_1v1", "LW_2v2"]:
+        tournament_map = "IRON_CAGE"
+    
+    # Cap max teams based on mode
+    max_teams_cap = {
+        "BR": 48,   # supports large tournaments
+        "CS_4v4": 16, "CS_2v2": 16, "CS_1v1": 48,  # CS bracket style
+        "LW_1v1": 48, "LW_2v2": 16
+    }
+    max_teams = min(data.maxTeams, max_teams_cap.get(mode, 48))
     
     tournament_doc = {
         "name": data.name,
         "map": data.map,
         "scheduledAt": datetime.fromisoformat(data.scheduledAt.replace("Z", "+00:00")),
         "entryFee": data.entryFee,
-        "maxTeams": data.maxTeams,
+        "maxTeams": max_teams,
         "playersPerTeam": players_per_team,
         "prizePool": data.prizePool,
         "perKillPrize": data.perKillPrize,
@@ -2133,7 +2213,7 @@ async def create_tournament(data: TournamentCreate, admin: dict = Depends(get_ad
         "mode": mode,
         "description": data.description,
         "status": "DRAFT",
-        "totalSlots": data.maxTeams,
+        "totalSlots": max_teams,
         "filledSlots": 0,
         "createdAt": datetime.now(timezone.utc),
         "updatedAt": datetime.now(timezone.utc)
