@@ -1363,34 +1363,43 @@ async def get_pending_invites(user: dict = Depends(get_current_user)):
 async def list_tournaments(
     status: Optional[str] = None,
     map: Optional[str] = None,
-    minFee: Optional[float] = None,
-    maxFee: Optional[float] = None,
+    minFee: Optional[str] = None,
+    maxFee: Optional[str] = None,
     mode: Optional[str] = None
 ):
     query = {}
     
-    # Always exclude DRAFT from public listing; filter by status if provided
-    if status and status not in ("all", "ALL", ""):
-        query["status"] = status
-        # Still exclude DRAFT if someone sends status=DRAFT (shouldn't happen)
-        if status == "DRAFT":
+    # Always exclude DRAFT; handle "undefined" from frontend
+    clean_status = status if status and status not in ("undefined", "null", "all", "ALL", "") else None
+    clean_map = map if map and map not in ("undefined", "null", "all", "") else None
+    clean_mode = mode if mode and mode not in ("undefined", "null", "all", "") else None
+    
+    if clean_status:
+        if clean_status == "DRAFT":
             return []
+        query["status"] = clean_status
     else:
-        # Show everything except DRAFT
         query["status"] = {"$nin": ["DRAFT"]}
     
-    if map and map != "all":
-        query["map"] = map
+    if clean_map:
+        query["map"] = clean_map
     
-    if mode and mode != "all":
-        query["mode"] = mode
+    if clean_mode:
+        query["mode"] = clean_mode
     
-    if minFee is not None or maxFee is not None:
+    # Parse fees - ignore "undefined" strings from frontend
+    try:
+        min_fee = float(minFee) if minFee and minFee not in ("undefined", "null", "") else None
+        max_fee = float(maxFee) if maxFee and maxFee not in ("undefined", "null", "") else None
+    except (ValueError, TypeError):
+        min_fee = max_fee = None
+    
+    if min_fee is not None or max_fee is not None:
         query["entryFee"] = {}
-        if minFee is not None:
-            query["entryFee"]["$gte"] = minFee
-        if maxFee is not None:
-            query["entryFee"]["$lte"] = maxFee
+        if min_fee is not None:
+            query["entryFee"]["$gte"] = min_fee
+        if max_fee is not None:
+            query["entryFee"]["$lte"] = max_fee
     
     # Exclude cup qualifier sub-tournaments from main listing
     # (cup qualifiers have cupId set — show them only via cup page)
@@ -1524,22 +1533,34 @@ async def check_eligibility(tournament_id: str, user: dict = Depends(get_current
     if p_settings.get("mobileVerifyRequired", False) and not user.get("mobileVerified"):
         issues.append({"code": "MOBILE_NOT_VERIFIED", "message": "Mobile verification required"})
     
-    # Check team based on tournament mode
-    team = teams_col.find_one({"members": user["id"]})
+    # ✅ Fetch tournament FIRST before using it
+    tournament = tournaments_col.find_one({"_id": ObjectId(tournament_id)})
+    
+    # Check tournament status
+    if not tournament:
+        issues.append({"code": "TOURNAMENT_NOT_FOUND", "message": "Tournament not found"})
+    elif tournament["status"] != "REGISTERING":
+        issues.append({"code": "REGISTRATION_CLOSED", "message": "Registration not open"})
+    elif tournament["filledSlots"] >= tournament["maxTeams"]:
+        issues.append({"code": "TOURNAMENT_FULL", "message": "Tournament is full"})
+    
+    # Get mode info
     t_mode = tournament.get("mode", "BR") if tournament else "BR"
     players_needed = tournament.get("playersPerTeam", 4) if tournament else 4
     
     solo_modes = ["CS_1v1", "LW_1v1"]
     duo_modes = ["CS_2v2", "LW_2v2"]
     
+    # Check team based on mode
+    team = teams_col.find_one({"members": user["id"]})
+    
     if t_mode in solo_modes:
-        # Solo — no team needed, player registers individually
-        pass
+        pass  # Solo — no team needed
     elif t_mode in duo_modes:
         if not team:
-            issues.append({"code": "NO_TEAM", "message": "Need a team of 2 for this mode"})
+            issues.append({"code": "NO_TEAM", "message": "Need a duo team for this mode"})
         elif len(team.get("members", [])) < 2:
-            issues.append({"code": "TEAM_INCOMPLETE", "message": f"Team needs {players_needed} members"})
+            issues.append({"code": "TEAM_INCOMPLETE", "message": "Team needs 2 members for duo mode"})
     else:
         # BR and CS_4v4 — full squad of 4
         if not team:
@@ -1559,15 +1580,6 @@ async def check_eligibility(tournament_id: str, user: dict = Depends(get_current
     })
     if active_ban:
         issues.append({"code": "BANNED", "message": f"Account banned: {active_ban['reason']}"})
-    
-    # Check tournament
-    tournament = tournaments_col.find_one({"_id": ObjectId(tournament_id)})
-    if not tournament:
-        issues.append({"code": "TOURNAMENT_NOT_FOUND", "message": "Tournament not found"})
-    elif tournament["status"] != "REGISTERING":
-        issues.append({"code": "REGISTRATION_CLOSED", "message": "Registration not open"})
-    elif tournament["filledSlots"] >= tournament["maxTeams"]:
-        issues.append({"code": "TOURNAMENT_FULL", "message": "Tournament is full"})
     
     # Check existing registration
     if team:
@@ -2221,12 +2233,20 @@ async def create_tournament(data: TournamentCreate, admin: dict = Depends(get_ad
     
     result = tournaments_col.insert_one(tournament_doc)
     
-    # Create 6 matches
-    for i in range(1, 7):
+    # Create matches - use maps list if provided, otherwise single map
+    maps_list = getattr(data, "maps", None) or [tournament_map]
+    if not maps_list:
+        maps_list = [tournament_map]
+    
+    # For multi-match tournaments, create one match per map
+    num_matches = max(len(maps_list), 1)
+    
+    for i in range(1, num_matches + 1):
+        map_for_match = maps_list[i - 1] if i <= len(maps_list) else tournament_map
         matches_col.insert_one({
             "tournamentId": str(result.inserted_id),
             "matchNumber": i,
-            "mapName": data.map,
+            "mapName": map_for_match,
             "status": "PENDING",
             "createdAt": datetime.now(timezone.utc)
         })
@@ -2785,34 +2805,8 @@ async def seed_database():
             "updatedAt": datetime.now(timezone.utc)
         })
     
-    # Create sample tournament
-    if not tournaments_col.find_one({"name": "OSG Weekly #1"}):
-        tournament = tournaments_col.insert_one({
-            "name": "OSG Weekly #1",
-            "map": "BERMUDA",
-            "scheduledAt": datetime.now(timezone.utc) + timedelta(days=2),
-            "entryFee": 50,
-            "maxTeams": 12,
-            "playersPerTeam": 4,
-            "prizePool": {"1": 500, "2": 300, "3": 200},
-            "perKillPrize": 5,
-            "rules": "Standard Free Fire Battle Royale rules apply. No hacking, teaming, or glitch abuse.",
-            "status": "REGISTERING",
-            "totalSlots": 12,
-            "filledSlots": 0,
-            "createdAt": datetime.now(timezone.utc),
-            "updatedAt": datetime.now(timezone.utc)
-        })
-        
-        # Create matches
-        for i in range(1, 7):
-            matches_col.insert_one({
-                "tournamentId": str(tournament.inserted_id),
-                "matchNumber": i,
-                "mapName": "BERMUDA",
-                "status": "PENDING",
-                "createdAt": datetime.now(timezone.utc)
-            })
+    # NOTE: No auto-tournament creation — admin creates manually
+    # Sample tournament removed to prevent duplicates on redeploy
     
     return {"message": "Seed complete. Admin: admin@osglive.in / Admin@1234"}
 
@@ -3181,6 +3175,455 @@ async def get_appeal_count(admin: dict = Depends(get_admin_user)):
 async def clear_all_rate_limits(admin: dict = Depends(get_admin_user)):
     rate_limits_col.delete_many({})
     return {"message": "All rate limits cleared"}
+
+# ============== SPECIAL TOURNAMENT SYSTEM (48 teams) ==============
+
+@app.post("/api/admin/special-tournaments")
+async def create_special_tournament(data: dict, admin: dict = Depends(get_admin_user)):
+    """
+    Create a Special Tournament for 13-48 teams.
+    This creates a parent 'special tournament' record only — 
+    actual qualifier tournaments are created separately and linked.
+    """
+    name = data.get("name", "OSG Special Tournament")
+    total_teams = int(data.get("totalTeams", 24))
+    teams_per_qualifier = int(data.get("teamsPerQualifier", 12))
+    advance_per_qualifier = int(data.get("advancePerQualifier", 6))
+    entry_fee = float(data.get("entryFee", 50))
+    prize_pool = data.get("prizePool", {"1": 5000, "2": 2500, "3": 1000})
+    per_kill = float(data.get("perKillPrize", 5))
+    rules = data.get("rules", "Special Tournament rules apply.")
+    scheduled_at_str = data.get("scheduledAt")
+    
+    scheduled_at = datetime.now(timezone.utc) + timedelta(days=7)
+    if scheduled_at_str:
+        try:
+            scheduled_at = datetime.fromisoformat(scheduled_at_str.replace("Z","")).replace(tzinfo=timezone.utc)
+        except:
+            pass
+    
+    # Calculate structure
+    num_qualifiers = max(1, -(-total_teams // teams_per_qualifier))  # ceiling division
+    total_in_semis = num_qualifiers * advance_per_qualifier
+    
+    # Determine if semis needed
+    needs_semis = total_in_semis > 12
+    
+    structure = {
+        "totalTeams": total_teams,
+        "numQualifiers": num_qualifiers,
+        "teamsPerQualifier": teams_per_qualifier,
+        "advancePerQualifier": advance_per_qualifier,
+        "totalInSemis": total_in_semis,
+        "needsSemis": needs_semis,
+        "finalsTeams": 12 if needs_semis else total_in_semis,
+        "stage": "QUALIFIERS"
+    }
+    
+    special = db["special_tournaments"].insert_one({
+        "name": name,
+        "totalTeams": total_teams,
+        "entryFee": entry_fee,
+        "prizePool": prize_pool,
+        "perKillPrize": per_kill,
+        "rules": rules,
+        "scheduledAt": scheduled_at,
+        "structure": structure,
+        "status": "UPCOMING",
+        "qualifierTournaments": [],
+        "semiTournaments": [],
+        "finalsTournamentId": None,
+        "createdBy": admin["id"],
+        "createdAt": datetime.now(timezone.utc),
+    })
+    
+    special_id = str(special.inserted_id)
+    
+    return {
+        "message": f"Special tournament '{name}' created",
+        "specialId": special_id,
+        "structure": structure,
+        "instructions": f"Create {num_qualifiers} qualifier tournaments manually and link them using /api/admin/special-tournaments/{special_id}/link-qualifier"
+    }
+
+@app.post("/api/admin/special-tournaments/{special_id}/create-qualifier")
+async def create_qualifier_for_special(special_id: str, data: dict, admin: dict = Depends(get_admin_user)):
+    """Create a qualifier tournament and auto-link to special tournament"""
+    special = db["special_tournaments"].find_one({"_id": ObjectId(special_id)})
+    if not special:
+        raise HTTPException(status_code=404, detail="Special tournament not found")
+    
+    qualifier_num = len(special.get("qualifierTournaments", [])) + 1
+    max_qualifiers = special["structure"]["numQualifiers"]
+    
+    if qualifier_num > max_qualifiers:
+        raise HTTPException(status_code=400, detail=f"All {max_qualifiers} qualifiers already created")
+    
+    name = data.get("name", f"{special['name']} — Qualifier {qualifier_num}")
+    scheduled_at_str = data.get("scheduledAt")
+    scheduled_at = datetime.now(timezone.utc) + timedelta(days=qualifier_num)
+    if scheduled_at_str:
+        try:
+            scheduled_at = datetime.fromisoformat(scheduled_at_str.replace("Z","")).replace(tzinfo=timezone.utc)
+        except:
+            pass
+    
+    maps_list = data.get("maps", ["BERMUDA","PURGATORY","KALAHARI","ALPHINE","NEXTERRA","SOLARA"])
+    
+    t = tournaments_col.insert_one({
+        "name": name,
+        "specialTournamentId": special_id,
+        "specialTournamentName": special["name"],
+        "tournamentType": "SPECIAL_QUALIFIER",
+        "qualifierNumber": qualifier_num,
+        "map": maps_list[0],
+        "maps": maps_list,
+        "matchCount": len(maps_list),
+        "scheduledAt": scheduled_at,
+        "entryFee": special["entryFee"],
+        "maxTeams": special["structure"]["teamsPerQualifier"],
+        "playersPerTeam": 4,
+        "mode": "BR",
+        "prizePool": {},
+        "perKillPrize": special["perKillPrize"],
+        "rules": special["rules"],
+        "status": "UPCOMING",
+        "totalSlots": special["structure"]["teamsPerQualifier"],
+        "filledSlots": 0,
+        "advanceCount": special["structure"]["advancePerQualifier"],
+        "createdAt": datetime.now(timezone.utc),
+        "updatedAt": datetime.now(timezone.utc)
+    })
+    t_id = str(t.inserted_id)
+    
+    # Create 6 matches with maps
+    for mi, map_name in enumerate(maps_list):
+        matches_col.insert_one({
+            "tournamentId": t_id,
+            "matchNumber": mi + 1,
+            "mapName": map_name,
+            "status": "PENDING",
+            "createdAt": datetime.now(timezone.utc)
+        })
+    
+    # Link to special tournament
+    db["special_tournaments"].update_one(
+        {"_id": ObjectId(special_id)},
+        {"$push": {"qualifierTournaments": {"id": t_id, "name": name, "qualifierNumber": qualifier_num}}}
+    )
+    
+    return {"message": f"Qualifier {qualifier_num} created", "tournamentId": t_id}
+
+@app.get("/api/admin/special-tournaments/{special_id}/standings")
+async def get_special_standings(special_id: str, stage: str = "qualifiers", admin: dict = Depends(get_admin_user)):
+    """Get standings from all qualifier/semi tournaments for team selection"""
+    special = db["special_tournaments"].find_one({"_id": ObjectId(special_id)})
+    if not special:
+        raise HTTPException(status_code=404, detail="Not found")
+    
+    if stage == "qualifiers":
+        tourney_list = special.get("qualifierTournaments", [])
+    else:
+        tourney_list = special.get("semiTournaments", [])
+    
+    all_standings = []
+    for t_info in tourney_list:
+        standings = await get_tournament_standings(t_info["id"])
+        for team in standings:
+            all_standings.append({
+                **team,
+                "fromTournament": t_info["name"],
+                "tournamentId": t_info["id"],
+                "qualifierNumber": t_info.get("qualifierNumber", 0)
+            })
+    
+    return all_standings
+
+@app.post("/api/admin/special-tournaments/{special_id}/create-next-stage")
+async def create_next_stage(special_id: str, data: dict, admin: dict = Depends(get_admin_user)):
+    """
+    Create Semi-Final or Final tournament with selected teams imported.
+    data: {
+        stage: "SEMI" | "FINALS",
+        selectedTeams: [{ teamId, teamName, fromTournamentId }],
+        name: str,
+        scheduledAt: str,
+        maps: [...],
+        prizePool: {...} (only for finals)
+    }
+    """
+    special = db["special_tournaments"].find_one({"_id": ObjectId(special_id)})
+    if not special:
+        raise HTTPException(status_code=404, detail="Not found")
+    
+    stage = data.get("stage", "SEMI")
+    selected_teams = data.get("selectedTeams", [])
+    name = data.get("name", f"{special['name']} — {stage}")
+    maps_list = data.get("maps", ["BERMUDA","PURGATORY","KALAHARI","ALPHINE","NEXTERRA","SOLARA"])
+    prize_pool = data.get("prizePool", special.get("prizePool", {}))
+    
+    scheduled_at = datetime.now(timezone.utc) + timedelta(days=14)
+    if data.get("scheduledAt"):
+        try:
+            scheduled_at = datetime.fromisoformat(data["scheduledAt"].replace("Z","")).replace(tzinfo=timezone.utc)
+        except:
+            pass
+    
+    t_type = "SPECIAL_SEMI" if stage == "SEMI" else "SPECIAL_FINALS"
+    
+    t = tournaments_col.insert_one({
+        "name": name,
+        "specialTournamentId": special_id,
+        "specialTournamentName": special["name"],
+        "tournamentType": t_type,
+        "map": maps_list[0],
+        "maps": maps_list,
+        "matchCount": len(maps_list),
+        "scheduledAt": scheduled_at,
+        "entryFee": 0,
+        "maxTeams": len(selected_teams),
+        "playersPerTeam": 4,
+        "mode": "BR",
+        "prizePool": prize_pool if stage == "FINALS" else {},
+        "perKillPrize": special["perKillPrize"],
+        "rules": special["rules"],
+        "status": "UPCOMING",
+        "totalSlots": len(selected_teams),
+        "filledSlots": len(selected_teams),
+        "advancingTeams": selected_teams,
+        "isFinals": stage == "FINALS",
+        "createdAt": datetime.now(timezone.utc),
+        "updatedAt": datetime.now(timezone.utc)
+    })
+    t_id = str(t.inserted_id)
+    
+    # Create matches
+    for mi, map_name in enumerate(maps_list):
+        matches_col.insert_one({
+            "tournamentId": t_id,
+            "matchNumber": mi + 1,
+            "mapName": map_name,
+            "status": "PENDING",
+            "createdAt": datetime.now(timezone.utc)
+        })
+    
+    # Auto-register selected teams
+    for slot_i, team_info in enumerate(selected_teams):
+        registrations_col.update_one(
+            {"tournamentId": t_id, "teamId": team_info["teamId"]},
+            {"$set": {
+                "tournamentId": t_id,
+                "teamId": team_info["teamId"],
+                "slotNumber": slot_i + 1,
+                "paymentStatus": "PAID",
+                "amountPaid": 0,
+                "fromTournament": team_info.get("fromTournamentId", ""),
+                "registeredAt": datetime.now(timezone.utc),
+                "confirmedAt": datetime.now(timezone.utc)
+            }},
+            upsert=True
+        )
+        
+        # Notify each team member of qualification
+        team_doc = teams_col.find_one({"_id": ObjectId(team_info["teamId"])})
+        if team_doc:
+            for member_id in team_doc.get("members", []):
+                notifications_col.insert_one({
+                    "userId": member_id,
+                    "title": f"🎉 Qualified for {name}!",
+                    "message": f"Congratulations! Your team '{team_info['teamName']}' has qualified for {name}. Get ready!",
+                    "type": "SUCCESS",
+                    "isRead": False,
+                    "link": f"/tournaments/{t_id}",
+                    "createdAt": datetime.now(timezone.utc)
+                })
+    
+    # Notify NON-qualified teams from source tournaments (disqualified teams)
+    if stage == "SEMI" or stage == "FINALS":
+        source_tournament_ids = list(set([t["fromTournamentId"] for t in selected_teams if t.get("fromTournamentId")]))
+        qualified_team_ids = set(t["teamId"] for t in selected_teams)
+        
+        for src_t_id in source_tournament_ids:
+            all_regs = list(registrations_col.find({"tournamentId": src_t_id, "paymentStatus": "PAID"}))
+            for reg in all_regs:
+                if reg["teamId"] not in qualified_team_ids:
+                    team_doc = teams_col.find_one({"_id": ObjectId(reg["teamId"])})
+                    if team_doc:
+                        for member_id in team_doc.get("members", []):
+                            notifications_col.insert_one({
+                                "userId": member_id,
+                                "title": "Tournament Update",
+                                "message": f"Unfortunately your team did not advance from the qualifier. Thank you for participating in {special['name']}!",
+                                "type": "INFO",
+                                "isRead": False,
+                                "createdAt": datetime.now(timezone.utc)
+                            })
+    
+    # Update special tournament record
+    field = "semiTournaments" if stage == "SEMI" else "finalsTournamentId"
+    if stage == "SEMI":
+        db["special_tournaments"].update_one(
+            {"_id": ObjectId(special_id)},
+            {"$push": {"semiTournaments": {"id": t_id, "name": name}}}
+        )
+    else:
+        db["special_tournaments"].update_one(
+            {"_id": ObjectId(special_id)},
+            {"$set": {"finalsTournamentId": t_id, "status": "FINALS_CREATED"}}
+        )
+    
+    return {
+        "message": f"{stage} tournament created with {len(selected_teams)} teams",
+        "tournamentId": t_id,
+        "teamsImported": len(selected_teams)
+    }
+
+@app.get("/api/admin/special-tournaments")
+async def list_special_tournaments(admin: dict = Depends(get_admin_user)):
+    specials = list(db["special_tournaments"].find().sort("createdAt", DESCENDING))
+    return [serialize_doc(s) for s in specials]
+
+@app.get("/api/admin/special-tournaments/{special_id}")
+async def get_special_tournament(special_id: str, admin: dict = Depends(get_admin_user)):
+    special = db["special_tournaments"].find_one({"_id": ObjectId(special_id)})
+    if not special:
+        raise HTTPException(status_code=404, detail="Not found")
+    return serialize_doc(special)
+
+@app.post("/api/seed/special-test")
+async def seed_special_test():
+    """Create a test special tournament with 24 teams for testing the flow"""
+    import random
+    
+    # Clean up old test
+    old = db["special_tournaments"].find_one({"name": "TEST Special Tournament"})
+    if old:
+        for t_info in old.get("qualifierTournaments", []):
+            t_id = t_info["id"]
+            for m in matches_col.find({"tournamentId": t_id}):
+                match_results_col.delete_many({"matchId": str(m["_id"])})
+            matches_col.delete_many({"tournamentId": t_id})
+            registrations_col.delete_many({"tournamentId": t_id})
+            tournaments_col.delete_one({"_id": ObjectId(t_id)})
+        db["special_tournaments"].delete_one({"_id": old["_id"]})
+    
+    # Create special
+    special = db["special_tournaments"].insert_one({
+        "name": "TEST Special Tournament",
+        "totalTeams": 24,
+        "entryFee": 50,
+        "prizePool": {"1": 5000, "2": 2500, "3": 1000},
+        "perKillPrize": 5,
+        "rules": "Test rules",
+        "scheduledAt": datetime.now(timezone.utc),
+        "structure": {
+            "totalTeams": 24,
+            "numQualifiers": 2,
+            "teamsPerQualifier": 12,
+            "advancePerQualifier": 6,
+            "totalInSemis": 12,
+            "needsSemis": False,
+            "finalsTeams": 12,
+            "stage": "QUALIFIERS"
+        },
+        "status": "ACTIVE",
+        "qualifierTournaments": [],
+        "semiTournaments": [],
+        "finalsTournamentId": None,
+        "createdBy": "test",
+        "createdAt": datetime.now(timezone.utc),
+    })
+    special_id = str(special.inserted_id)
+    
+    team_names_q1 = ["ALPHA SQUAD","BETA FORCE","GAMMA STRIKE","DELTA TEAM","EPSILON","ZETA","ETA","THETA","IOTA","KAPPA","LAMBDA","MU"]
+    team_names_q2 = ["SIGMA TEAM","TAU FORCE","UPSILON","PHI SQUAD","CHI","PSI","OMEGA","ALPHA 2","BETA 2","GAMMA 2","DELTA 2","EPSILON 2"]
+    maps_list = ["BERMUDA","PURGATORY","KALAHARI","ALPHINE","NEXTERRA","SOLARA"]
+    
+    admin_user = users_col.find_one({"role": "ADMIN"})
+    admin_id = str(admin_user["_id"]) if admin_user else "000000000000000000000001"
+    
+    qualifier_ids = []
+    for q_num, team_names in enumerate([team_names_q1, team_names_q2], 1):
+        t = tournaments_col.insert_one({
+            "name": f"TEST Special Tournament — Qualifier {q_num}",
+            "specialTournamentId": special_id,
+            "specialTournamentName": "TEST Special Tournament",
+            "tournamentType": "SPECIAL_QUALIFIER",
+            "qualifierNumber": q_num,
+            "map": "BERMUDA",
+            "maps": maps_list,
+            "matchCount": 6,
+            "scheduledAt": datetime.now(timezone.utc),
+            "entryFee": 50,
+            "maxTeams": 12,
+            "playersPerTeam": 4,
+            "mode": "BR",
+            "prizePool": {},
+            "perKillPrize": 5,
+            "rules": "Test",
+            "status": "LIVE",
+            "totalSlots": 12,
+            "filledSlots": 12,
+            "advanceCount": 6,
+            "createdAt": datetime.now(timezone.utc),
+            "updatedAt": datetime.now(timezone.utc)
+        })
+        t_id = str(t.inserted_id)
+        qualifier_ids.append(t_id)
+        
+        # Create matches
+        match_ids = []
+        for mi, map_name in enumerate(maps_list):
+            m = matches_col.insert_one({
+                "tournamentId": t_id, "matchNumber": mi+1,
+                "mapName": map_name, "status": "COMPLETED",
+                "playedAt": datetime.now(timezone.utc),
+                "createdAt": datetime.now(timezone.utc)
+            })
+            match_ids.append(str(m.inserted_id))
+        
+        # Create fake teams and results
+        team_ids = []
+        for idx, name in enumerate(team_names):
+            existing = teams_col.find_one({"name": name, "isTestTeam": True})
+            if existing:
+                team_ids.append(str(existing["_id"]))
+            else:
+                tt = teams_col.insert_one({"name": name, "captainId": admin_id, "members": [admin_id], "isActive": True, "isTestTeam": True, "createdAt": datetime.now(timezone.utc), "updatedAt": datetime.now(timezone.utc)})
+                team_ids.append(str(tt.inserted_id))
+            
+            registrations_col.update_one(
+                {"tournamentId": t_id, "teamId": team_ids[-1]},
+                {"$set": {"tournamentId": t_id, "teamId": team_ids[-1], "slotNumber": idx+1, "paymentStatus": "PAID", "amountPaid": 50, "registeredAt": datetime.now(timezone.utc), "confirmedAt": datetime.now(timezone.utc)}},
+                upsert=True
+            )
+        
+        # Generate results for all 6 matches
+        for match_id in match_ids:
+            placements = list(range(1, 13))
+            random.shuffle(placements)
+            for ti, team_id in enumerate(team_ids):
+                placement = placements[ti]
+                kills = random.randint(3, 12) if placement == 1 else random.randint(0, 6)
+                pts = calculate_match_points(kills, placement)
+                match_results_col.update_one(
+                    {"matchId": match_id, "teamId": team_id},
+                    {"$set": {"matchId": match_id, "teamId": team_id, "kills": kills, "placement": placement, "booyah": placement==1, **pts}},
+                    upsert=True
+                )
+        
+        db["special_tournaments"].update_one(
+            {"_id": special.inserted_id},
+            {"$push": {"qualifierTournaments": {"id": t_id, "name": f"Qualifier {q_num}", "qualifierNumber": q_num}}}
+        )
+    
+    return {
+        "message": "Test special tournament created with 2 qualifiers (12 teams each) and random results!",
+        "specialId": special_id,
+        "qualifier1Id": qualifier_ids[0] if qualifier_ids else None,
+        "qualifier2Id": qualifier_ids[1] if len(qualifier_ids) > 1 else None,
+        "instructions": "Go to Admin → Special Tournaments → TEST Special Tournament → View standings → Select top 6 from each → Create Finals"
+    }
 
 # ============== PLATFORM SETTINGS ==============
 @app.get("/api/admin/platform-settings")
