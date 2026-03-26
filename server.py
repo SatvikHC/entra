@@ -2215,7 +2215,7 @@ async def create_tournament(data: TournamentCreate, admin: dict = Depends(get_ad
     tournament_doc = {
         "name": data.name,
         "map": data.map,
-        "scheduledAt": datetime.fromisoformat(data.scheduledAt.replace("Z", "+00:00")).astimezone(timezone.utc),
+        "scheduledAt": datetime.fromisoformat(data.scheduledAt.replace("Z", "+00:00")),
         "entryFee": data.entryFee,
         "maxTeams": max_teams,
         "playersPerTeam": players_per_team,
