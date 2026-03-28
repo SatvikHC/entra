@@ -25,7 +25,6 @@ from enum import Enum
 from decimal import Decimal
 from pymongo import MongoClient, DESCENDING, ASCENDING
 import uuid
-import secrets 
 
 # Initialize FastAPI
 app = FastAPI(title="OSG LIVE API", version="1.0.0")
@@ -72,11 +71,12 @@ banned_ips_col.create_index("ip", unique=True)
 SECRET_KEY = os.environ.get("JWT_SECRET", "osg-live-super-secret-key-2024")
 
 # SMTP Email Config
-SMTP_HOST = os.environ.get("SMTP_HOST", "tg.toonverse.icu")
+SMTP_HOST = os.environ.get("SMTP_HOST", "mail.osglive.in")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
-SMTP_USER = os.environ.get("SMTP_USER", "otp@tg.toonverse.icu")
-SMTP_PASS = os.environ.get("SMTP_PASS", "BWoX@a&gGJ8JHD!,")
-SMTP_FROM = os.environ.get("SMTP_FROM", "OSG LIVE <otp@tg.toonverse.icu>")
+SMTP_USER = os.environ.get("SMTP_USER", "no-reply-otp-verify@osglive.in")
+SMTP_PASS = os.environ.get("SMTP_PASS", "_O.FOeyZG-JEiPV7")
+SMTP_FROM = os.environ.get("SMTP_FROM", "OSG LIVE <no-reply-otp-verify@osglive.in>")
+
 
 def send_email(to_email: str, subject: str, html_body: str):
     """Send email via cPanel SMTP"""
@@ -788,47 +788,109 @@ async def verify_otp(mobile: str, code: str):
     
     return {"message": "Mobile verified successfully"}
 
+
+
+
+
+
 @app.post("/api/auth/forgot-password")
-async def forgot_password(email: EmailStr, request: Request):
+async def forgot_password(request: Request):
+    body = await request.json()
+    email = body.get("email", "").lower().strip()
     ip = get_client_ip(request)
-    if not check_rate_limit(f"forgot:{ip}"):
-        raise HTTPException(status_code=429, detail="Too many requests")
-    
+
+    if not check_rate_limit(f"forgot:{ip}", limit=5, window_minutes=15):
+        raise HTTPException(status_code=429, detail="Too many requests. Try again later.")
+
     user = users_col.find_one({"email": email})
     if user:
-        reset_token = str(uuid.uuid4())
+        reset_token = secrets.token_urlsafe(32)
         users_col.update_one(
             {"_id": user["_id"]},
-            {
-                "$set": {
-                    "passwordResetToken": reset_token,
-                    "passwordResetExpiry": datetime.now(timezone.utc) + timedelta(hours=1)
-                }
-            }
+            {"$set": {
+                "passwordResetToken": reset_token,
+                "passwordResetExpiry": datetime.now(timezone.utc) + timedelta(hours=1)
+            }}
         )
-        print(f"[EMAIL] Password reset link sent to {email}")
-    
-    return {"message": "If email exists, reset link has been sent"}
+
+        frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+        reset_link = f"{frontend_url}/reset-password?token={reset_token}"
+
+        html = f"""
+        <div style="background:#0A0A0A;padding:40px;font-family:Arial,sans-serif;max-width:520px;margin:0 auto;border-radius:12px">
+          <div style="text-align:center;margin-bottom:24px">
+            <h1 style="color:#FF6B00;font-size:28px;margin:0;letter-spacing:2px">OSG LIVE</h1>
+            <p style="color:#71717A;font-size:13px;margin:4px 0 0">Free Fire Esports Platform</p>
+          </div>
+          <h2 style="color:#FFFFFF;font-size:20px;margin:0 0 12px">Reset Your Password</h2>
+          <p style="color:#A1A1AA;font-size:14px;line-height:1.6;margin:0 0 24px">
+            We received a request to reset the password for your OSG LIVE account.
+            Click the button below to set a new password. This link is valid for <strong style="color:#FFFFFF">1 hour</strong>.
+          </p>
+          <div style="text-align:center;margin:32px 0">
+            <a href="{reset_link}"
+               style="display:inline-block;background:#FF6B00;color:#FFFFFF;padding:14px 40px;
+                      border-radius:8px;text-decoration:none;font-weight:700;font-size:16px;
+                      letter-spacing:0.5px">
+              Reset Password
+            </a>
+          </div>
+          <p style="color:#52525B;font-size:12px;line-height:1.6;margin:24px 0 0">
+            If you didn't request a password reset, you can safely ignore this email.
+            Your password won't change until you click the link above and create a new one.
+          </p>
+          <hr style="border:none;border-top:1px solid #222;margin:24px 0"/>
+          <p style="color:#3F3F46;font-size:11px;text-align:center;margin:0">
+            OSG LIVE &bull; <a href="mailto:support@tg.toonverse.icu" style="color:#3F3F46">support@tg.toonverse.icu</a>
+          </p>
+        </div>
+        """
+        send_email(email, "OSG LIVE - Reset Your Password", html)
+
+    return {"message": "If this email is registered, a password reset link has been sent."}
+
 
 @app.post("/api/auth/reset-password")
-async def reset_password(token: str, new_password: str):
+async def reset_password(request: Request):
+    body = await request.json()
+    token = body.get("token", "")
+    new_password = body.get("newPassword", "")
+
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    if not re.search(r'[A-Z]', new_password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one uppercase letter")
+    if not re.search(r'\d', new_password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one number")
+    if not re.search(r'[!@#$%^&*(),.?":{}|<>]', new_password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one special character")
+
     user = users_col.find_one({
         "passwordResetToken": token,
         "passwordResetExpiry": {"$gt": datetime.now(timezone.utc)}
     })
-    
+
     if not user:
-        raise HTTPException(status_code=400, detail="Invalid or expired token")
-    
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link. Please request a new one.")
+
     users_col.update_one(
         {"_id": user["_id"]},
         {
-            "$set": {"passwordHash": get_password_hash(new_password)},
+            "$set": {"passwordHash": get_password_hash(new_password), "updatedAt": datetime.now(timezone.utc)},
             "$unset": {"passwordResetToken": "", "passwordResetExpiry": ""}
         }
     )
-    
-    return {"message": "Password reset successfully"}
+
+    notifications_col.insert_one({
+        "userId": str(user["_id"]),
+        "title": "Password Changed",
+        "message": "Your password was successfully reset. If this wasn\'t you, contact support immediately.",
+        "type": "INFO",
+        "isRead": False,
+        "createdAt": datetime.now(timezone.utc)
+    })
+
+    return {"message": "Password reset successfully. You can now login with your new password."}
 
 # ============== PLAYER ROUTES ==============
 @app.get("/api/player/profile")
@@ -3658,178 +3720,6 @@ async def get_public_platform_settings():
 @app.get("/api/health")
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
-
-
-@app.post("/api/auth/forgot-password")
-async def forgot_password(email: str):
-    user = userscol.find_one({"email": email.lower()})
-    if not user:
-        # Don't reveal if email exists
-        return {"message": "If this email is registered, a reset link has been sent."}
-    reset_token = secrets.token_urlsafe(32)
-    userscol.update_one({"_id": user["_id"]}, {"$set": {
-        "resetToken": reset_token,
-        "resetTokenExpiry": datetime.now(timezone.utc) + timedelta(hours=1)
-    }})
-    # Send email with reset link
-    reset_link = f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/reset-password?token={reset_token}"
-    await send_email(
-        to=email,
-        subject="OSG Password Reset",
-        body=f"Click this link to reset your password (valid 1 hour):\n\n{reset_link}\n\nIf you didn't request this, ignore this email."
-    )
-    return {"message": "If this email is registered, a reset link has been sent."}
-
-@app.post("/api/auth/reset-password")
-async def reset_password(token: str, newPassword: str):
-    user = userscol.find_one({"resetToken": token})
-    if not user:
-        raise HTTPException(status_code=400, detail="Invalid or expired token")
-    if user.get("resetTokenExpiry") and user["resetTokenExpiry"] < datetime.now(timezone.utc):
-        raise HTTPException(status_code=400, detail="Token expired. Request a new one.")
-    hashed = hashpw(newPassword.encode(), gensalt()).decode()
-    userscol.update_one({"_id": user["_id"]}, {"$set": {
-        "passwordHash": hashed
-    }, "$unset": {"resetToken": "", "resetTokenExpiry": ""}})
-    return {"message": "Password reset successfully"}
-
-# ─── HACKER PENALTY -₹25 ────────────────────────────────────────────────────
-@app.post("/api/admin/players/{player_id}/penalize")
-async def penalize_player(player_id: str, data: dict, admin: dict = Depends(get_admin_user)):
-    reason = data.get("reason", "Rule violation / hacking")
-    user = userscol.find_one({"_id": ObjectId(player_id)})
-    if not user:
-        raise HTTPException(status_code=404, detail="Player not found")
-    current_balance = user.get("walletBalance", 0)
-    new_balance = current_balance - 25  # Goes negative if needed
-    userscol.update_one({"_id": ObjectId(player_id)}, {"$set": {"walletBalance": new_balance}})
-    # Transaction record
-    transactionscol.insert_one({
-        "userId": player_id, "type": "DEBIT", "amount": 25,
-        "description": f"Penalty: {reason}",
-        "balanceBefore": current_balance, "balanceAfter": new_balance,
-        "createdAt": datetime.now(timezone.utc)
-    })
-    # Notification to player
-    notificationscol.insert_one({
-        "userId": player_id,
-        "title": "⚠️ Penalty Applied",
-        "message": f"₹25 deducted from your wallet. Reason: {reason}",
-        "type": "DANGER", "isRead": False,
-        "createdAt": datetime.now(timezone.utc)
-    })
-    # Send email
-    await send_email(
-        to=user.get("email", ""),
-        subject="OSG - Penalty Notice",
-        body=f"Dear {user.get('ign', 'Player')},\n\nA penalty of ₹25 has been deducted from your wallet.\nReason: {reason}\nNew Balance: ₹{new_balance}\n\nIf you believe this is a mistake, contact support."
-    )
-    # Discord webhook
-    discord_webhook = os.getenv("DISCORD_WEBHOOK_URL")
-    if discord_webhook:
-        import httpx
-        async with httpx.AsyncClient() as client:
-            await client.post(discord_webhook, json={
-                "content": f"⚠️ **Hacker Penalty** | Player: `{user.get('ign')}` | Reason: {reason} | Balance: ₹{new_balance} | <@satvik4152>"
-            })
-    return {"message": "Penalty applied", "newBalance": new_balance}
-
-# ─── ADMIN: GET ALL TEAMS ────────────────────────────────────────────────────
-@app.get("/api/admin/teams")
-async def get_admin_teams(search: Optional[str] = None, admin: dict = Depends(get_admin_user)):
-    query = {}
-    if search:
-        query["name"] = {"$regex": search, "$options": "i"}
-    teams = list(teamscol.find(query).sort("createdAt", DESCENDING))
-    result = []
-    for team in teams:
-        members = []
-        for mid in team.get("members", []):
-            m = userscol.find_one({"_id": ObjectId(mid)}, {"passwordHash": 0})
-            if m:
-                members.append({"id": str(mid), "ign": m.get("ign"), "ffUid": m.get("ffUid"), "email": m.get("email")})
-        result.append({**serialize_doc(team), "memberDetails": members})
-    return result
-
-# ─── ADMIN: BAN ENTIRE TEAM ──────────────────────────────────────────────────
-@app.post("/api/admin/teams/{team_id}/ban")
-async def ban_team(team_id: str, data: dict, admin: dict = Depends(get_admin_user)):
-    reason = data.get("reason", "Team cheat/hack violation")
-    team = teamscol.find_one({"_id": ObjectId(team_id)})
-    if not team:
-        raise HTTPException(status_code=404, detail="Team not found")
-    banned_members = []
-    for mid in team.get("members", []):
-        user = userscol.find_one({"_id": ObjectId(mid)})
-        if not user: continue
-        current_balance = user.get("walletBalance", 0)
-        new_balance = current_balance - 25
-        # Deduct penalty
-        userscol.update_one({"_id": ObjectId(mid)}, {"$set": {"walletBalance": new_balance}})
-        # Ban record
-        banscol.insert_one({
-            "userId": str(mid), "reason": reason, "isActive": True,
-            "bannedBy": admin["id"], "createdAt": datetime.now(timezone.utc),
-            "banType": "TEAM_CHEAT"
-        })
-        # Notification
-        notificationscol.insert_one({
-            "userId": str(mid),
-            "title": "🚫 Account Banned",
-            "message": f"Your account has been banned. Reason: {reason}. ₹25 penalty deducted.",
-            "type": "DANGER", "isRead": False,
-            "createdAt": datetime.now(timezone.utc)
-        })
-        # Email
-        await send_email(
-            to=user.get("email", ""),
-            subject="OSG - Account Banned",
-            body=f"Dear {user.get('ign', 'Player')},\nYour account has been banned for: {reason}\nPenalty: ₹25 deducted. Balance: ₹{new_balance}\n\nFor appeals, provide proof (Google Drive links only)."
-        )
-        banned_members.append(user.get("ign"))
-    # Discord notification
-    discord_webhook = os.getenv("DISCORD_WEBHOOK_URL")
-    if discord_webhook:
-        import httpx
-        async with httpx.AsyncClient() as client:
-            await client.post(discord_webhook, json={
-                "content": f"🚫 **Team Banned** | Team: `{team['name']}` | Members: {', '.join(banned_members)} | Reason: {reason} | <@satvik4152>"
-            })
-    return {"message": f"Team banned. {len(banned_members)} members penalized."}
-
-# ─── IGN 7-DAY COOLDOWN (add to existing profile update endpoint) ────────────
-# In your existing /api/player/profile PUT handler, REPLACE the ign update logic with:
-#
-#   if "ign" in update_data and update_data["ign"] != user.get("ign"):
-#       last_changed = user.get("ignLastChanged")
-#       if last_changed:
-#           diff = datetime.now(timezone.utc) - last_changed
-#           if diff.days < 7:
-#               days_left = 7 - diff.days
-#               raise HTTPException(400, f"IGN can only be changed every 7 days. {days_left} day(s) remaining.")
-#       update_data["ignLastChanged"] = datetime.now(timezone.utc)
-
-# ─── ANALYTICS ────────────────────────────────────────────────────────────────
-@app.get("/api/admin/analytics")
-async def get_analytics(admin: dict = Depends(get_admin_user)):
-    total_players = userscol.count_documents({"role": "PLAYER"})
-    total_tournaments = tournamentscol.count_documents({})
-    total_registrations = registrationscol.count_documents({"paymentStatus": "PAID"})
-    total_revenue = sum(r.get("amountPaid", 0) for r in registrationscol.find({"paymentStatus": "PAID"}))
-    active_bans = banscol.count_documents({"isActive": True})
-    wallet_total = sum(u.get("walletBalance", 0) for u in userscol.find({"role": "PLAYER"}))
-    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    today_regs = registrationscol.count_documents({"paymentStatus": "PAID", "registeredAt": {"$gte": today}})
-    return {
-        "totalPlayers": total_players,
-        "totalTournaments": total_tournaments,
-        "totalRegistrations": total_registrations,
-        "totalRevenue": total_revenue,
-        "activeBans": active_bans,
-        "totalWalletBalance": wallet_total,
-        "todayRegistrations": today_regs,
-    }
-
 
 if __name__ == "__main__":
     import uvicorn
