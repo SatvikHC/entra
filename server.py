@@ -1347,7 +1347,7 @@ async def invite_to_team(data: TeamInvite, user: dict = Depends(get_current_user
     # Add to pending invites
     teams_col.update_one(
         {"_id": team["_id"]},
-        {"$addToSet": {"pendingInvites": player_id}}
+        {"$addToSet": {"pendingInvites": str(player_id)}}
     )
     
     # Create notification
@@ -1363,6 +1363,7 @@ async def invite_to_team(data: TeamInvite, user: dict = Depends(get_current_user
     
     return {"message": f"Invitation sent to {player['ign']}"}
 
+    
 @app.post("/api/teams/accept/{team_id}")
 async def accept_invite(team_id: str, current_user: dict = Depends(get_current_user)):
     if not team_id or team_id in ("undefined", "null", ""):
@@ -1398,11 +1399,13 @@ async def accept_invite(team_id: str, current_user: dict = Depends(get_current_u
     if len(team.get("members", [])) >= 4:
         raise HTTPException(status_code=400, detail="Team is already full")
 
+    # Store as STRING not ObjectId to stay consistent with rest of codebase
+    user_id_str = str(user_oid)
     teams_col.update_one(
         {"_id": team_oid},
         {
-            "$addToSet": {"members": user_oid},
-            "$pull": {"pendingInvites": user_oid}
+            "$addToSet": {"members": user_id_str},
+            "$pull": {"pendingInvites": {"$in": [user_oid, user_id_str]}}
         }
     )
 
@@ -1428,7 +1431,6 @@ async def accept_invite(team_id: str, current_user: dict = Depends(get_current_u
         "team_id": str(team_oid),
         "team_name": team.get("name", "")
     }
-
 @app.delete("/api/teams/member/{member_id}")
 async def remove_member(member_id: str, user: dict = Depends(get_current_user)):
     team = teams_col.find_one({"captainId": user["id"]})
