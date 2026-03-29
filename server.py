@@ -1273,6 +1273,44 @@ async def delete_redeem_code(code_id: str, admin: dict = Depends(get_admin_user)
     return {"message": "Code deactivated"}
 
 # ============== TEAM ROUTES ==============
+@app.get("/api/teams/invites")
+async def get_my_invites(current_user: dict = Depends(get_current_user)):
+    user_id_str = get_user_id_str(current_user)
+    if not user_id_str or user_id_str in ("", "None"):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # Find all teams where this user is in pendingInvites (stored as str)
+    teams = list(teams_col.find({"pendingInvites": user_id_str}))
+
+    result = []
+    for team in teams:
+        # Get captain info
+        captain = None
+        captain_id = str(team.get("captainId", ""))
+        if captain_id:
+            try:
+                captain_doc = users_col.find_one({"_id": ObjectId(captain_id)})
+                if captain_doc:
+                    captain = {
+                        "id": captain_id,
+                        "ign": captain_doc.get("ign", ""),
+                        "ffUid": captain_doc.get("ffUid", "")
+                    }
+            except Exception:
+                pass
+
+        result.append({
+            "id":             str(team["_id"]),
+            "name":           team.get("name", ""),
+            "captainId":      captain_id,
+            "captain":        captain,
+            "memberCount":    len(team.get("members", [])),
+            "pendingInvites": [str(p) for p in team.get("pendingInvites", [])]
+        })
+
+    return result
+    
+
 @app.post("/api/teams")
 async def create_team(data: TeamCreate, user: dict = Depends(get_current_user)):
     # Check if user already in a team
