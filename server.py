@@ -819,7 +819,7 @@ async def forgot_password(request: Request):
             }}
         )
 
-        frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+        frontend_url = os.environ.get("FRONTEND_URL", "https://osglive.in")
         reset_link = f"{frontend_url}/reset-password?token={reset_token}"
 
         html = f"""
