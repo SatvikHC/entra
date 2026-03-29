@@ -1277,35 +1277,40 @@ async def delete_redeem_code(code_id: str, admin: dict = Depends(get_admin_user)
 @app.get("/api/teams/invites")
 async def get_my_invites(current_user: dict = Depends(get_current_user)):
     """Returns all teams where the logged-in user has a pending invite."""
-    user_id_str = get_user_id_str(current_user)
-    if not user_id_str or user_id_str in ("", "None"):
+    # Extract user ID safely — handles both 'id' and '_id' keys
+    raw_id = current_user.get("id") or current_user.get("_id") or ""
+    user_id_str = str(raw_id).strip()
+
+    if not user_id_str or user_id_str in ("", "None", "null"):
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # pendingInvites stores plain strings (from our fixed invite route)
+    # pendingInvites stores plain strings — search by string
     teams = list(teams_col.find({"pendingInvites": user_id_str}))
 
     result = []
     for team in teams:
         captain_info = None
         captain_id = str(team.get("captainId", ""))
-        if captain_id:
+        if captain_id and captain_id not in ("", "None"):
             try:
                 cap = users_col.find_one({"_id": ObjectId(captain_id)})
                 if cap:
-                    captain_info = {"ign": cap.get("ign", ""), "id": captain_id}
+                    captain_info = {
+                        "id":  captain_id,
+                        "ign": cap.get("ign", ""),
+                    }
             except Exception:
                 pass
 
         result.append({
-            "id":          str(team["_id"]),   # ← "id" not "_id" (FastAPI convention)
+            "id":          str(team["_id"]),   # ← "id" not "_id" — frontend reads this
             "name":        team.get("name", ""),
             "captainId":   captain_id,
             "captain":     captain_info,
             "memberCount": len(team.get("members", [])),
         })
 
-    return result  # returns JSON array directly
-    
+    return result
 
 @app.post("/api/teams")
 async def create_team(data: TeamCreate, user: dict = Depends(get_current_user)):
