@@ -1273,42 +1273,38 @@ async def delete_redeem_code(code_id: str, admin: dict = Depends(get_admin_user)
     return {"message": "Code deactivated"}
 
 # ============== TEAM ROUTES ==============
+# GET /api/teams/invites  ← NOTE: "invites" plural, GET method
 @app.get("/api/teams/invites")
 async def get_my_invites(current_user: dict = Depends(get_current_user)):
+    """Returns all teams where the logged-in user has a pending invite."""
     user_id_str = get_user_id_str(current_user)
     if not user_id_str or user_id_str in ("", "None"):
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # Find all teams where this user is in pendingInvites (stored as str)
+    # pendingInvites stores plain strings (from our fixed invite route)
     teams = list(teams_col.find({"pendingInvites": user_id_str}))
 
     result = []
     for team in teams:
-        # Get captain info
-        captain = None
+        captain_info = None
         captain_id = str(team.get("captainId", ""))
         if captain_id:
             try:
-                captain_doc = users_col.find_one({"_id": ObjectId(captain_id)})
-                if captain_doc:
-                    captain = {
-                        "id": captain_id,
-                        "ign": captain_doc.get("ign", ""),
-                        "ffUid": captain_doc.get("ffUid", "")
-                    }
+                cap = users_col.find_one({"_id": ObjectId(captain_id)})
+                if cap:
+                    captain_info = {"ign": cap.get("ign", ""), "id": captain_id}
             except Exception:
                 pass
 
         result.append({
-            "id":             str(team["_id"]),
-            "name":           team.get("name", ""),
-            "captainId":      captain_id,
-            "captain":        captain,
-            "memberCount":    len(team.get("members", [])),
-            "pendingInvites": [str(p) for p in team.get("pendingInvites", [])]
+            "id":          str(team["_id"]),   # ← "id" not "_id" (FastAPI convention)
+            "name":        team.get("name", ""),
+            "captainId":   captain_id,
+            "captain":     captain_info,
+            "memberCount": len(team.get("members", [])),
         })
 
-    return result
+    return result  # returns JSON array directly
     
 
 @app.post("/api/teams")
