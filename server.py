@@ -1378,7 +1378,7 @@ async def accept_invite(team_id: str, current_user: dict = Depends(get_current_u
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
 
-    user_id = str(current_user["_id"])
+    user_id = str(current_user.get("_id") or current_user.get("id") or current_user["_id"])
 
     # Check if already a member
     if user_id in [str(m) for m in team.get("members", [])]:
