@@ -1364,26 +1364,64 @@ async def invite_to_team(data: TeamInvite, user: dict = Depends(get_current_user
     return {"message": f"Invitation sent to {player['ign']}"}
 
 @app.post("/api/teams/accept/{team_id}")
-async def accept_invite(team_id: str, user: dict = Depends(get_current_user)):
-    team = teams_col.find_one({"_id": ObjectId(team_id)})
+async def accept_invite(team_id: str, current_user: dict = Depends(get_current_user)):
+    # ✅ Guard against "undefined" or invalid IDs from frontend
+    if not team_id or team_id in ("undefined", "null", ""):
+        raise HTTPException(status_code=400, detail="Invalid team ID")
+    
+    try:
+        oid = ObjectId(team_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid team ID format: {team_id}")
+
+    team = teams_col.find_one({"_id": oid})
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
-    
-    if user["id"] not in team.get("pendingInvites", []):
-        raise HTTPException(status_code=400, detail="No pending invite found")
-    
-    if teams_col.find_one({"members": user["id"]}):
-        raise HTTPException(status_code=400, detail="You are already in a team")
-    
+
+    user_id = str(current_user["_id"])
+
+    # Check if already a member
+    if user_id in [str(m) for m in team.get("members", [])]:
+        raise HTTPException(status_code=400, detail="Already a member of this team")
+
+    # Check if invite exists for this user
+    invite = invites_col.find_one({
+        "team_id": oid,
+        "invitee_id": current_user["_id"],
+        "status": "pending"
+    })
+    if not invite:
+        raise HTTPException(status_code=404, detail="No pending invite found")
+
+    # Accept: add user to team members
     teams_col.update_one(
-        {"_id": ObjectId(team_id)},
-        {
-            "$addToSet": {"members": user["id"]},
-            "$pull": {"pendingInvites": user["id"]}
-        }
+        {"_id": oid},
+        {"$addToSet": {"members": current_user["_id"]}}
     )
-    
-    return {"message": f"Joined team {team['name']}"}
+
+    # Mark invite as accepted
+    invites_col.update_one(
+        {"_id": invite["_id"]},
+        {"$set": {"status": "accepted"}}
+    )
+
+    # Notify team owner
+    owner_id = team.get("owner_id") or team.get("created_by")
+    if owner_id:
+        notifications_col.insert_one({
+            "user_id": owner_id,
+            "type": "invite_accepted",
+            "message": f"{current_user.get('username', 'A user')} accepted your team invite",
+            "data": {"team_id": str(oid), "team_name": team.get("name", "")},
+            "read": False,
+            "created_at": datetime.utcnow()
+        })
+
+    return {
+        "message": "Successfully joined the team",
+        "team_id": str(oid),
+        "team_name": team.get("name", "")
+    }
 
 @app.post("/api/teams/leave")
 async def leave_team(user: dict = Depends(get_current_user)):
