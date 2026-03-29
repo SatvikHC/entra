@@ -1273,18 +1273,14 @@ async def delete_redeem_code(code_id: str, admin: dict = Depends(get_admin_user)
     return {"message": "Code deactivated"}
 
 # ============== TEAM ROUTES ==============
-# GET /api/teams/invites  ← NOTE: "invites" plural, GET method
 @app.get("/api/teams/invites")
 async def get_my_invites(current_user: dict = Depends(get_current_user)):
-    """Returns all teams where the logged-in user has a pending invite."""
-    # Extract user ID safely — handles both 'id' and '_id' keys
     raw_id = current_user.get("id") or current_user.get("_id") or ""
     user_id_str = str(raw_id).strip()
 
     if not user_id_str or user_id_str in ("", "None", "null"):
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # pendingInvites stores plain strings — search by string
     teams = list(teams_col.find({"pendingInvites": user_id_str}))
 
     result = []
@@ -1295,15 +1291,12 @@ async def get_my_invites(current_user: dict = Depends(get_current_user)):
             try:
                 cap = users_col.find_one({"_id": ObjectId(captain_id)})
                 if cap:
-                    captain_info = {
-                        "id":  captain_id,
-                        "ign": cap.get("ign", ""),
-                    }
+                    captain_info = {"id": captain_id, "ign": cap.get("ign", "")}
             except Exception:
                 pass
 
         result.append({
-            "id":          str(team["_id"]),   # ← "id" not "_id" — frontend reads this
+            "id":          str(team["_id"]),
             "name":        team.get("name", ""),
             "captainId":   captain_id,
             "captain":     captain_info,
@@ -1428,37 +1421,27 @@ async def accept_invite(team_id: str, current_user: dict = Depends(get_current_u
     except Exception:
         raise HTTPException(status_code=400, detail=f"Invalid team ID format: {team_id}")
 
-    # Validate current user
-    user_id_str = get_user_id_str(current_user)
-    if not user_id_str or user_id_str in ("None", ""):
-        raise HTTPException(status_code=401, detail="User not authenticated")
+    # Extract user ID inline — no helper needed
+    raw_id = current_user.get("id") or current_user.get("_id") or ""
+    user_id_str = str(raw_id).strip()
+    if not user_id_str or user_id_str in ("", "None", "null"):
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # Fetch team
     team = teams_col.find_one({"_id": team_oid})
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
 
-    # Normalize stored IDs to strings for safe comparison
     member_ids  = [str(m) for m in team.get("members", [])]
     pending_ids = [str(p) for p in team.get("pendingInvites", [])]
 
     if user_id_str in member_ids:
         raise HTTPException(status_code=400, detail="You are already a member of this team")
-
     if user_id_str not in pending_ids:
         raise HTTPException(status_code=404, detail="No pending invite found for your account")
-
     if len(member_ids) >= 4:
         raise HTTPException(status_code=400, detail="Team is already full")
 
-    # Check if user joined another team while invite was pending
-    existing_team = teams_col.find_one({"members": user_id_str, "_id": {"$ne": team_oid}})
-    if existing_team:
-        # Clean up stale invite
-        teams_col.update_one({"_id": team_oid}, {"$pull": {"pendingInvites": user_id_str}})
-        raise HTTPException(status_code=400, detail="You are already a member of another team")
-
-    # Add member (str) and remove from pendingInvites (str)
+    # Add as member, remove from pending — both stored as strings
     teams_col.update_one(
         {"_id": team_oid},
         {
@@ -1467,26 +1450,26 @@ async def accept_invite(team_id: str, current_user: dict = Depends(get_current_u
         }
     )
 
-    # Notify the captain — use same schema as invite notifications
+    # Notify captain
     captain_id = str(team.get("captainId", ""))
     if captain_id and captain_id not in ("", "None"):
         try:
             notifications_col.insert_one({
                 "userId":    captain_id,
                 "title":     "Invite Accepted",
-                "message":   f"{current_user.get('ign') or current_user.get('username') or 'A player'} accepted your team invite and joined '{team.get('name', '')}'",
+                "message":   f"{current_user.get('ign') or current_user.get('username') or 'A player'} joined '{team.get('name', '')}'",
                 "type":      "SUCCESS",
                 "isRead":    False,
                 "link":      "/dashboard/team",
                 "createdAt": datetime.now(timezone.utc)
             })
         except Exception:
-            pass  # Notification failure must never block the join
+            pass
 
     return {
-        "message":   "Successfully joined the team",
-        "teamId":    str(team_oid),
-        "teamName":  team.get("name", "")
+        "message": "Successfully joined the team",
+        "teamId":  str(team_oid),
+        "teamName": team.get("name", "")
     }
 
 
