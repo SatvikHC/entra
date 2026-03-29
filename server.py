@@ -1274,35 +1274,28 @@ async def delete_redeem_code(code_id: str, admin: dict = Depends(get_admin_user)
 
 # ============== TEAM ROUTES ==============
 @app.get("/api/teams/invites")
-async def get_my_invites(current_user: dict = Depends(get_current_user)):
-    raw_id = current_user.get("id") or current_user.get("_id") or ""
-    user_id_str = str(raw_id).strip()
+async def get_pending_invites(current_user: dict = Depends(get_current_user)):
+    useridraw = current_user.get("_id") or current_user.get("id")
+    if not useridraw:
+        raise HTTPException(status_code=401, detail="User not authenticated")
+    try:
+        useroid = useridraw if isinstance(useridraw, ObjectId) else ObjectId(str(useridraw))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid user ID in token")
 
-    if not user_id_str or user_id_str in ("", "None", "null"):
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    teams = list(teams_col.find({"pendingInvites": user_id_str}))
+    # ✅ Query as string — that's how invite stores it
+    teams = list(teamscol.find({"pendingInvites": str(useroid)}))
 
     result = []
     for team in teams:
-        captain_info = None
-        captain_id = str(team.get("captainId", ""))
-        if captain_id and captain_id not in ("", "None"):
-            try:
-                cap = users_col.find_one({"_id": ObjectId(captain_id)})
-                if cap:
-                    captain_info = {"id": captain_id, "ign": cap.get("ign", "")}
-            except Exception:
-                pass
-
         result.append({
-            "id":          str(team["_id"]),
-            "name":        team.get("name", ""),
-            "captainId":   captain_id,
-            "captain":     captain_info,
-            "memberCount": len(team.get("members", [])),
+            "id": str(team["_id"]),
+            "name": team.get("name", ""),
+            "captainId": str(team.get("captainId")) if team.get("captainId") else None,
+            "members": [str(m) for m in team.get("members", [])],
+            "pendingInvites": [str(p) for p in team.get("pendingInvites", [])],
+            "isActive": team.get("isActive", True),
         })
-
     return result
 
 @app.post("/api/teams")
@@ -1411,66 +1404,60 @@ async def invite_to_team(data: TeamInvite, user: dict = Depends(get_current_user
 
     return {"message": f"Invitation sent to {player.get('ign', player_id_str)}"}
     
-@app.post("/api/teams/accept/{team_id}")
-async def accept_invite(team_id: str, current_user: dict = Depends(get_current_user)):
-    # Validate team_id
-    if not team_id or team_id in ("undefined", "null", ""):
+@app.post("/api/teams/accept/{teamid}")
+async def accept_invite(teamid: str, current_user: dict = Depends(get_current_user)):
+    if not teamid or teamid in ["undefined", "null", ""]:
         raise HTTPException(status_code=400, detail="Invalid team ID")
     try:
-        team_oid = ObjectId(team_id)
+        teamoid = ObjectId(teamid)
     except Exception:
-        raise HTTPException(status_code=400, detail=f"Invalid team ID format: {team_id}")
+        raise HTTPException(status_code=400, detail=f"Invalid team ID format: {teamid}")
 
-    # Extract user ID inline — no helper needed
-    raw_id = current_user.get("id") or current_user.get("_id") or ""
-    user_id_str = str(raw_id).strip()
-    if not user_id_str or user_id_str in ("", "None", "null"):
-        raise HTTPException(status_code=401, detail="Not authenticated")
+    useridraw = current_user.get("_id") or current_user.get("id")
+    if not useridraw:
+        raise HTTPException(status_code=401, detail="User not authenticated")
+    try:
+        useroid = useridraw if isinstance(useridraw, ObjectId) else ObjectId(str(useridraw))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid user ID in token")
 
-    team = teams_col.find_one({"_id": team_oid})
+    team = teamscol.find_one({"_id": teamoid})
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
 
-    member_ids  = [str(m) for m in team.get("members", [])]
-    pending_ids = [str(p) for p in team.get("pendingInvites", [])]
+    memberids = [str(m) for m in team.get("members", [])]
+    pendingids = [str(p) for p in team.get("pendingInvites", [])]
 
-    if user_id_str in member_ids:
-        raise HTTPException(status_code=400, detail="You are already a member of this team")
-    if user_id_str not in pending_ids:
-        raise HTTPException(status_code=404, detail="No pending invite found for your account")
-    if len(member_ids) >= 4:
+    if str(useroid) in memberids:
+        raise HTTPException(status_code=400, detail="Already a member of this team")
+    if str(useroid) not in pendingids:
+        raise HTTPException(status_code=404, detail="No pending invite found")
+    if len(team.get("members", [])) >= 4:
         raise HTTPException(status_code=400, detail="Team is already full")
 
-    # Add as member, remove from pending — both stored as strings
-    teams_col.update_one(
-        {"_id": team_oid},
-        {
-            "$addToSet": {"members": user_id_str},
-            "$pull":     {"pendingInvites": user_id_str}
-        }
-    )
+    # ✅ Store as string (consistent with how invite stored it)
+    teamscol.update_one({"_id": teamoid}, {
+        "$addToSet": {"members": str(useroid)},
+        "$pull": {"pendingInvites": str(useroid)}
+    })
 
-    # Notify captain
-    captain_id = str(team.get("captainId", ""))
-    if captain_id and captain_id not in ("", "None"):
+    # ✅ Notify captain with correct field names
+    captainid = str(team.get("captainId", ""))
+    if captainid:
         try:
             notifications_col.insert_one({
-                "userId":    captain_id,
-                "title":     "Invite Accepted",
-                "message":   f"{current_user.get('ign') or current_user.get('username') or 'A player'} joined '{team.get('name', '')}'",
-                "type":      "SUCCESS",
-                "isRead":    False,
-                "link":      "/dashboard/team",
+                "userId": captainid,
+                "title": "Invite Accepted!",
+                "message": f"{current_user.get('ign', 'A player')} accepted your team invite.",
+                "type": "SUCCESS",
+                "isRead": False,
+                "link": "/admin/players/" + str(useroid),
                 "createdAt": datetime.now(timezone.utc)
             })
         except Exception:
             pass
 
-    return {
-        "message": "Successfully joined the team",
-        "teamId":  str(team_oid),
-        "teamName": team.get("name", "")
-    }
+    return {"message": "Successfully joined the team", "teamId": teamid, "teamName": team.get("name", "")}
 
 
 @app.delete("/api/teams/member/{member_id}")
