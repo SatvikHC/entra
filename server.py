@@ -312,6 +312,41 @@ class PaymentVerify(BaseModel):
     paymentId: str
     signature: str
 
+# ─── Admin auth dependency — place AFTER your JWT/SECRET_KEY setup ────────────
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Security
+
+_bearer = HTTPBearer(auto_error=False)
+
+async def get_current_admin(credentials: HTTPAuthorizationCredentials = Security(_bearer)):
+    """Verify JWT token and confirm user is admin."""
+    if not credentials or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Admin token required")
+
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        role: str    = payload.get("role", "")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    if role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    user = users_col.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=401, detail="Admin user not found")
+
+    return {
+        "id":    str(user["_id"]),
+        "_id":   str(user["_id"]),
+        "role":  user.get("role", ""),
+        "email": user.get("email", ""),
+    }
+        
 # ============== HELPERS ==============
 def serialize_doc(doc):
     """Convert MongoDB document to JSON-serializable dict"""
