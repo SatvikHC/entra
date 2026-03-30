@@ -4017,6 +4017,27 @@ async def get_public_platform_settings():
         "discordUrl": settings.get("discordUrl", "https://discord.gg/bpXVqbBN")
     }
 
+@app.get("/api/admin/debug/standings/{tournament_id}")
+async def debug_standings(tournament_id: str):
+    # Try all possible ways to find standings
+    results = {}
+    
+    results["by_string"] = list(standings_col.find(
+        {"tournamentId": tournament_id}, {"_id": 0}
+    ).limit(3))
+    
+    try:
+        results["by_objectid"] = list(standings_col.find(
+            {"tournamentId": ObjectId(tournament_id)}, {"_id": 0}
+        ).limit(3))
+    except:
+        results["by_objectid"] = []
+    
+    results["total_in_collection"] = standings_col.count_documents({})
+    results["sample_doc"] = standings_col.find_one({}, {"_id": 0})
+    
+    return results
+
 # Health check
 @app.get("/api/health")
 async def health_check():
