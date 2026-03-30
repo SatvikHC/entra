@@ -65,6 +65,8 @@ notifications_col = db["notifications"]
 otp_codes_col = db["otp_codes"]
 login_logs_col = db["login_logs"]
 rate_limits_col = db["rate_limits"]
+standings_col  = db["standings"]
+
 
 # Create indexes
 users_col.create_index("email", unique=True)
