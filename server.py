@@ -2647,7 +2647,7 @@ async def save_match_results(match_id: str, results: List[MatchResultEntry], adm
 @app.post("/api/admin/tournaments/{tournament_id}/distribute-prizes")
 async def distribute_prizes(
     tournament_id: str,
-    admin: dict = Depends(get_current_admin)
+    current_user: dict = Depends(get_current_user)
 ):
     try:
         t_oid = ObjectId(tournament_id)
