@@ -35,39 +35,6 @@ def get_user_id_str(user: dict) -> str:
     raw = user.get("id") or user.get("_id") or ""
     return str(raw).strip()
 
-# ─── Admin auth dependency ────────────────────────────────────────────────────
-async def get_current_admin(token: str = Depends(oauth2_scheme)):
-    """Same as get_current_user but also verifies the user is an admin."""
-    credentials_exception = HTTPException(
-        status_code=401,
-        detail="Could not validate admin credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
-        role: str = payload.get("role", "")
-        if user_id is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-
-    # Must be admin role
-    if role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    user = users_col.find_one({"_id": ObjectId(user_id)})
-    if user is None:
-        raise credentials_exception
-
-    return {
-        "id":   str(user["_id"]),
-        "_id":  str(user["_id"]),
-        "role": user.get("role", ""),
-        "email": user.get("email", ""),
-    }
-
-
 # CORS
 app.add_middleware(
     CORSMiddleware,
