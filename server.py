@@ -2658,119 +2658,149 @@ async def distribute_prizes(
     if not tournament:
         raise HTTPException(status_code=404, detail="Tournament not found")
 
-    prizes = tournament.get("prizes", {})
-    per_kill_prize = float(tournament.get("perKillPrize", 0))
+    # ── Prevent double distribution ───────────────────────────────────────
+    if tournament.get("prizesDistributed"):
+        raise HTTPException(status_code=400, detail="Prizes already distributed for this tournament")
+
+    prizes          = tournament.get("prizes", {})
+    per_kill_prize  = float(tournament.get("perKillPrize", 0))
     tournament_name = tournament.get("name", "Tournament")
+    t_type          = (tournament.get("type", "") or "").lower()
+    t_mode          = (tournament.get("mode", "") or "").lower()
+    players_per_team = int(tournament.get("playersPerTeam", 4))
 
-    # ── Determine players per team based on tournament type ────────────────
-    tournament_type = tournament.get("type", "")
-    mode = tournament.get("mode", "")
-
-    # Solo types: Lone Wolf 1v1, Clash Squad 1v1
+    # ── Detect tournament format ──────────────────────────────────────────
     is_solo = (
-        "1v1" in tournament_type or
-        "lone_wolf_1v1" in mode or
-        "lone wolf 1v1" in tournament_type.lower() or
-        tournament.get("playersPerTeam", 4) == 1
+        players_per_team == 1 or
+        "1v1" in t_type or
+        "1v1" in t_mode or
+        "lone wolf 1v1" in t_type or
+        "lone_wolf_1v1" in t_mode
     )
-    # Duo types: Lone Wolf 2v2, Clash Squad 2v2
-    is_duo = (
-        "2v2" in tournament_type or
-        "lone_wolf_2v2" in mode or
-        "lone wolf 2v2" in tournament_type.lower() or
-        tournament.get("playersPerTeam", 4) == 2
+    is_duo = (not is_solo) and (
+        players_per_team == 2 or
+        "2v2" in t_type or
+        "2v2" in t_mode or
+        "lone wolf 2v2" in t_type or
+        "lone_wolf_2v2" in t_mode
     )
+    is_team = not is_solo and not is_duo  # 4-player BR / CS 4v4
 
-    players_per_team = 1 if is_solo else (2 if is_duo else tournament.get("playersPerTeam", 4))
-
-    # ── Get standings sorted by total points ──────────────────────────────
-    standings = list(standings_col.find({"tournamentId": tournament_id}).sort("totalPoints", -1))
+    # ── Load standings sorted by total points desc ────────────────────────
+    standings = list(
+        standings_col.find({"tournamentId": tournament_id})
+        .sort("totalPoints", -1)
+    )
     if not standings:
-        raise HTTPException(status_code=400, detail="No standings found. Enter scores first.")
+        raise HTTPException(
+            status_code=400,
+            detail="No standings found. Enter and save scores first."
+        )
 
+    # ── Prize pool map ────────────────────────────────────────────────────
     prize_map = {
-        "1": float(prizes.get("first",  prizes.get("1st", 0))),
-        "2": float(prizes.get("second", prizes.get("2nd", 0))),
-        "3": float(prizes.get("third",  prizes.get("3rd", 0))),
+        "1": float(prizes.get("first",  prizes.get("1st",  0))),
+        "2": float(prizes.get("second", prizes.get("2nd",  0))),
+        "3": float(prizes.get("third",  prizes.get("3rd",  0))),
+        "4": float(prizes.get("fourth", prizes.get("4th",  0))),
+        "5": float(prizes.get("fifth",  prizes.get("5th",  0))),
     }
 
     distributed = []
     errors      = []
 
     for idx, standing in enumerate(standings):
-        rank      = idx + 1
-        rank_key  = str(rank)
-        rank_prize = prize_map.get(rank_key, 0.0)
+        rank       = idx + 1
+        rank_prize = prize_map.get(str(rank), 0.0)
 
-        total_kills      = standing.get("totalKills", 0)
+        total_kills      = int(standing.get("totalKills", 0) or 0)
         kill_prize_total = round(total_kills * per_kill_prize, 2)
         total_prize      = round(rank_prize + kill_prize_total, 2)
 
         if total_prize <= 0:
-            continue   # No prize for this rank, skip
+            continue  # no prize for this rank
 
-        # ── Find who to pay ────────────────────────────────────────────────
+        # ── Find player IDs to pay ────────────────────────────────────────
         player_ids = []
 
-        # Solo/duo: registration has userId directly
+        # Try to load the registration doc
         registration = None
-        reg_id = standing.get("registrationId") or standing.get("teamId")
-
+        reg_id = standing.get("registrationId") or standing.get("regId")
         if reg_id:
             try:
                 registration = registrations_col.find_one({"_id": ObjectId(str(reg_id))})
             except Exception:
                 pass
 
-        if is_solo or is_duo:
-            # ── Solo/Duo: pay the registered user(s) directly ──────────────
-            if registration:
-                # Solo: userId field
-                uid = registration.get("userId") or registration.get("user_id")
-                if uid:
-                    player_ids.append(str(uid))
+        # Also try team_id from standing
+        team_id = standing.get("teamId")
 
-                # Duo: memberIds or teamMembers array
+        if is_solo:
+            # ── Solo: one player ──────────────────────────────────────────
+            # Priority: standing.userId → registration.userId → registration.user_id
+            uid = (
+                standing.get("userId") or
+                standing.get("user_id") or
+                (registration.get("userId") if registration else None) or
+                (registration.get("user_id") if registration else None)
+            )
+            if uid:
+                player_ids = [str(uid)]
+
+        elif is_duo:
+            # ── Duo: two players ──────────────────────────────────────────
+            if registration:
+                # Check members array first (duo registered as pair)
                 for field in ["memberIds", "teamMembers", "members", "playerIds"]:
                     members = registration.get(field, [])
                     if members:
-                        player_ids = [str(m) for m in members]
+                        player_ids = [str(m) for m in members if m]
                         break
-
-            # Fallback: standing has userId directly (solo)
+            # Fallback: treat like solo (2v2 registered individually)
             if not player_ids:
-                uid = standing.get("userId") or standing.get("user_id")
+                uid = (
+                    standing.get("userId") or
+                    standing.get("user_id") or
+                    (registration.get("userId") if registration else None)
+                )
                 if uid:
-                    player_ids.append(str(uid))
+                    player_ids = [str(uid)]
 
         else:
-            # ── Team mode: find team members ───────────────────────────────
-            team_id = standing.get("teamId") or (registration.get("teamId") if registration else None)
-
+            # ── Team mode (4v4 BR / CS 4v4) ──────────────────────────────
             if team_id:
                 try:
-                    team = teams_col.find_one({"_id": ObjectId(str(team_id))})
-                    if team:
-                        player_ids = [str(m) for m in team.get("members", [])]
+                    team_doc = teams_col.find_one({"_id": ObjectId(str(team_id))})
+                    if team_doc:
+                        player_ids = [str(m) for m in team_doc.get("members", []) if m]
                 except Exception:
                     pass
 
-            # Fallback: get from registration
+            # Fallback: from registration
             if not player_ids and registration:
                 for field in ["memberIds", "teamMembers", "members"]:
                     members = registration.get(field, [])
                     if members:
-                        player_ids = [str(m) for m in members]
+                        player_ids = [str(m) for m in members if m]
                         break
 
+            # Fallback: captainId / userId
+            if not player_ids and registration:
+                uid = registration.get("captainId") or registration.get("userId")
+                if uid:
+                    player_ids = [str(uid)]
+
         if not player_ids:
-            errors.append(f"Rank {rank}: could not find player(s) to pay")
+            errors.append(f"Rank #{rank} ({standing.get('teamName', 'Unknown')}): no player IDs found")
             continue
 
-        # ── Prize per player ───────────────────────────────────────────────
+        # ── Calculate per-player prize ────────────────────────────────────
         prize_per_player = round(total_prize / max(len(player_ids), 1), 2)
 
         for pid in player_ids:
+            pid = str(pid).strip()
+            if not pid or pid in ("None", "null", ""):
+                continue
             try:
                 p_oid = ObjectId(pid)
             except Exception:
@@ -2784,27 +2814,33 @@ async def distribute_prizes(
             )
 
             # Transaction record
-            transactions_col.insert_one({
-                "userId":        pid,
-                "type":          "prize",
-                "amount":        prize_per_player,
-                "description":   f"Prize for #{rank} in {tournament_name}",
-                "tournamentId":  tournament_id,
-                "createdAt":     datetime.now(timezone.utc),
-            })
+            try:
+                transactions_col.insert_one({
+                    "userId":       pid,
+                    "type":         "prize",
+                    "amount":       prize_per_player,
+                    "description":  f"#{rank} Place prize in {tournament_name}",
+                    "tournamentId": tournament_id,
+                    "createdAt":    datetime.now(timezone.utc),
+                })
+            except Exception:
+                pass
 
             # Win notification
             try:
                 player = users_col.find_one({"_id": p_oid})
-                ign = player.get("ign", "Player") if player else "Player"
+                ign    = (player.get("ign") or player.get("username") or "Player") if player else "Player"
 
+                kill_note = (
+                    f" (₹{rank_prize} rank + {total_kills} kills × ₹{per_kill_prize})"
+                    if kill_prize_total > 0 else ""
+                )
                 notifications_col.insert_one({
                     "userId":    pid,
                     "title":     f"🏆 #{rank} Place — ₹{prize_per_player} Won!",
                     "message":   (
-                        f"Congratulations {ign}! You finished #{rank} in '{tournament_name}'. "
-                        f"₹{prize_per_player} has been credited to your wallet."
-                        + (f" (Rank ₹{rank_prize} + {total_kills} kills × ₹{per_kill_prize})" if kill_prize_total > 0 else "")
+                        f"Congrats {ign}! You finished #{rank} in '{tournament_name}'. "
+                        f"₹{prize_per_player} has been added to your wallet.{kill_note}"
                     ),
                     "type":      "SUCCESS",
                     "isRead":    False,
@@ -2815,22 +2851,29 @@ async def distribute_prizes(
                 pass
 
             distributed.append({
-                "rank":    rank,
+                "rank":     rank,
                 "playerId": pid,
-                "amount":  prize_per_player,
+                "amount":   prize_per_player,
             })
 
-    # Mark tournament prizes as distributed
+    # ── Mark tournament as distributed ───────────────────────────────────
     tournaments_col.update_one(
         {"_id": t_oid},
-        {"$set": {"prizesDistributed": True, "distributedAt": datetime.now(timezone.utc)}}
+        {"$set": {
+            "prizesDistributed": True,
+            "distributedAt":     datetime.now(timezone.utc),
+            "status":            "Completed"
+        }}
     )
 
+    total_paid = round(sum(d["amount"] for d in distributed), 2)
+
     return {
-        "message":     f"Prizes distributed to {len(distributed)} player(s)",
+        "message":     f"✅ Prizes distributed to {len(distributed)} player(s)",
         "distributed": distributed,
         "errors":      errors,
-        "totalPaid":   round(sum(d["amount"] for d in distributed), 2),
+        "totalPaid":   total_paid,
+        "skipped":     len(errors),
     }
 
 # ============== ADMIN PLAYER MANAGEMENT ==============
