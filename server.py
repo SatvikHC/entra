@@ -286,31 +286,39 @@ from fastapi import Security
 _bearer = HTTPBearer(auto_error=False)
 
 async def get_current_admin(credentials: HTTPAuthorizationCredentials = Security(_bearer)):
-    """Verify JWT token and confirm user is admin."""
     if not credentials or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Admin token required")
 
     token = credentials.credentials
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
-        role: str    = payload.get("role", "")
+        user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-    if role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    user = users_col.find_one({"_id": ObjectId(user_id)})
+    # ✅ Check DB directly — works even if JWT has no role field
+    user = users_col.find_one({"_id": ObjectId(str(user_id))})
     if not user:
-        raise HTTPException(status_code=401, detail="Admin user not found")
+        raise HTTPException(status_code=401, detail="User not found")
+
+    # ✅ Accept ANY of these admin indicators
+    is_admin = (
+        user.get("role") == "admin" or
+        user.get("isAdmin") == True or
+        user.get("is_admin") == True or
+        payload.get("role") == "admin" or
+        payload.get("isAdmin") == True
+    )
+
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
 
     return {
         "id":    str(user["_id"]),
         "_id":   str(user["_id"]),
-        "role":  user.get("role", ""),
+        "role":  "admin",
         "email": user.get("email", ""),
     }
         
