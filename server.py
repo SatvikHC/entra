@@ -2719,14 +2719,26 @@ async def distribute_prizes(
 
         # ── SOLO (LW_1v1, CS_1v1): winner is a single player ─────────────
         if is_solo:
-            # get_tournament_standings groups by teamId which for solo = the player's own "team"
-            # Try to get the real userId from the registration
             team_id = standing.get("teamId")
             uid = None
             if team_id:
                 try:
+                    # Registration only has teamId — look up team to get captainId/members
+                    team_doc = teams_col.find_one({"_id": ObjectId(str(team_id))})
+                    if team_doc:
+                        # solo team has 1 member — that's the player
+                        members = team_doc.get("members", [])
+                        if members:
+                            uid = str(members[0])
+                        elif team_doc.get("captainId"):
+                            uid = str(team_doc["captainId"])
+                except Exception:
+                    pass
+            # Fallback: check registration for any userId field
+            if not uid and team_id:
+                try:
                     reg = registrations_col.find_one({
-                        "teamId": team_id,
+                        "teamId": str(team_id),
                         "$or": [{"tournamentId": tournament_id}, {"tournamentId": t_oid}]
                     })
                     if reg:
@@ -2734,9 +2746,6 @@ async def distribute_prizes(
                                reg.get("playerId") or reg.get("user_id"))
                 except Exception:
                     pass
-            # Fallback: try teamId as userId directly (solo = team of 1)
-            if not uid:
-                uid = team_id
             if uid:
                 player_ids = [str(uid)]
 
