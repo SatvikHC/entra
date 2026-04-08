@@ -10,6 +10,8 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pydantic import BaseModel, EmailStr, Field, field_validator
+from bson import ObjectId
+from fastapi import Depends, HTTPException
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta, timezone
 from bson import ObjectId
@@ -212,6 +214,14 @@ class TournamentMode(str, Enum):
     CLASH_SQUAD_4v4 = "CS_4v4"
     LONE_WOLF_1v1 = "LW_1v1"
     LONE_WOLF_2v2 = "LW_2v2"
+
+
+class TeamRolesUpdate(BaseModel):
+    roles: Dict[str, str]  # { "userId": "IGL" | "Sniper" | "Rusher" | "Support" | "Sub" }
+
+class SelectPlayingMembers(BaseModel):
+    playing_member_ids: Optional[str] = None  # comma-separated member IDs
+
 
 class TournamentCreate(BaseModel):
     name: str
@@ -1354,27 +1364,23 @@ async def get_my_invites(current_user: dict = Depends(get_current_user)):
 
 @app.post("/api/teams")
 async def create_team(data: TeamCreate, user: dict = Depends(get_current_user)):
-    # Check if user already in a team
     existing = teams_col.find_one({"members": user["id"]})
     if existing:
         raise HTTPException(status_code=400, detail="You are already in a team")
-    
-    # Check team name
     if teams_col.find_one({"name": {"$regex": f"^{data.name}$", "$options": "i"}}):
         raise HTTPException(status_code=400, detail="Team name already taken")
-    
     team_doc = {
         "name": data.name,
         "captainId": user["id"],
         "members": [user["id"]],
+        "substituteId": None,
+        "roles": {},
         "pendingInvites": [],
         "isActive": True,
         "createdAt": datetime.now(timezone.utc),
         "updatedAt": datetime.now(timezone.utc)
     }
-    
     result = teams_col.insert_one(team_doc)
-    
     return {"message": "Team created", "id": str(result.inserted_id)}
 
 @app.get("/api/teams/my")
@@ -1382,23 +1388,24 @@ async def get_my_team(user: dict = Depends(get_current_user)):
     team = teams_col.find_one({"members": user["id"]})
     if not team:
         return None
-    
     team_data = serialize_doc(team)
-    
-    # Get member details
     members = []
     for member_id in team.get("members", []):
-        member = users_col.find_one({"_id": ObjectId(member_id)}, {"passwordHash": 0})
+        member = users_col.find_one({"_id": ObjectId(str(member_id))}, {"passwordHash": 0})
         if member:
+            mid = str(member["_id"])
             members.append({
-                "id": str(member["_id"]),
+                "id": mid,
                 "fullName": member["fullName"],
                 "ign": member["ign"],
                 "ffUid": member["ffUid"],
-                "isCaptain": str(member["_id"]) == team["captainId"]
+                "isCaptain": mid == str(team.get("captainId", "")),
+                "isSubstitute": mid == str(team.get("substituteId", "")),
+                "role": team.get("roles", {}).get(mid, None)
             })
-    
     team_data["memberDetails"] = members
+    team_data["memberCount"] = len(members)
+    team_data["isFull"] = len(members) >= 5
     return team_data
 
 
@@ -1412,8 +1419,8 @@ async def invite_to_team(data: TeamInvite, user: dict = Depends(get_current_user
     if not team:
         raise HTTPException(status_code=403, detail="Only team captain can invite")
 
-    if len(team.get("members", [])) >= 4:
-        raise HTTPException(status_code=400, detail="Team is full (max 4 players)")
+    if len(team.get("members", [])) >= 5:
+        raise HTTPException(status_code=400, detail="Team is full (max 5 players: 4 playing + 1 substitute)")
 
     player = users_col.find_one({"ffUid": data.ffUid})
     if not player:
@@ -1459,58 +1466,136 @@ async def invite_to_team(data: TeamInvite, user: dict = Depends(get_current_user
 async def accept_invite(team_id: str, current_user: dict = Depends(get_current_user)):
     if not team_id or team_id in ("undefined", "null", ""):
         raise HTTPException(status_code=400, detail="Invalid team ID")
-
     try:
         team_oid = ObjectId(team_id)
     except Exception:
         raise HTTPException(status_code=400, detail=f"Invalid team ID format: {team_id}")
-
     user_id_str = str(current_user.get("id") or current_user.get("_id") or "").strip()
     if not user_id_str or user_id_str in ("", "None"):
         raise HTTPException(status_code=401, detail="Not authenticated")
-
     team = teams_col.find_one({"_id": team_oid})
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
-
     member_ids  = [str(m) for m in team.get("members", [])]
     pending_ids = [str(p) for p in team.get("pendingInvites", [])]
-
     if user_id_str in member_ids:
         raise HTTPException(status_code=400, detail="Already a member of this team")
     if user_id_str not in pending_ids:
         raise HTTPException(status_code=404, detail="No pending invite found")
-    if len(member_ids) >= 4:
-        raise HTTPException(status_code=400, detail="Team is already full")
-
-    teams_col.update_one(
-        {"_id": team_oid},
-        {
-            "$addToSet": {"members": user_id_str},
-            "$pull":     {"pendingInvites": user_id_str}
-        }
-    )
-
+    if len(member_ids) >= 5:
+        raise HTTPException(status_code=400, detail="Team is already full (max 5)")
+    is_substitute = len(member_ids) == 4
+    update_op = {
+        "$addToSet": {"members": user_id_str},
+        "$pull": {"pendingInvites": user_id_str},
+        "$set": {"updatedAt": datetime.now(timezone.utc)}
+    }
+    if is_substitute:
+        update_op["$set"]["substituteId"] = user_id_str
+    teams_col.update_one({"_id": team_oid}, update_op)
     captain_id = str(team.get("captainId", ""))
-    if captain_id and captain_id not in ("", "None"):
+    if captain_id:
         try:
             notifications_col.insert_one({
-                "userId":    captain_id,
-                "title":     "Invite Accepted",
-                "message":   f"{current_user.get('ign') or current_user.get('username') or 'A player'} joined '{team.get('name', '')}'",
-                "type":      "SUCCESS",
-                "isRead":    False,
-                "link":      "/dashboard/team",
+                "userId": captain_id,
+                "title": "Invite Accepted",
+                "message": f"{current_user.get('ign') or 'A player'} joined '{team.get('name', '')}'" + (" as Substitute 🟡" if is_substitute else " ✅"),
+                "type": "SUCCESS", "isRead": False,
+                "link": "/dashboard/team",
                 "createdAt": datetime.now(timezone.utc)
             })
         except Exception:
             pass
-
     return {
-        "message":  "Successfully joined the team",
-        "teamId":   str(team_oid),
-        "teamName": team.get("name", "")
+        "message": "Successfully joined the team" + (" as Substitute" if is_substitute else ""),
+        "teamId": str(team_oid),
+        "teamName": team.get("name", ""),
+        "isSubstitute": is_substitute
     }
+
+
+# ── Assign roles (Captain only) ───────────────────────────────────────────────
+@app.put("/api/teams/roles")
+async def assign_roles(data: TeamRolesUpdate, user: dict = Depends(get_current_user)):
+    captain_id = str(user.get("id") or "")
+    team = teams_col.find_one({"captainId": captain_id})
+    if not team:
+        raise HTTPException(status_code=403, detail="Only team captain can assign roles")
+    VALID_ROLES = {"IGL", "Sniper", "Rusher", "Support", "Sub"}
+    member_ids = [str(m) for m in team.get("members", [])]
+    for uid, role in data.roles.items():
+        if uid not in member_ids:
+            raise HTTPException(status_code=400, detail=f"Player {uid} is not in your team")
+        if role not in VALID_ROLES:
+            raise HTTPException(status_code=400, detail=f"Invalid role '{role}'. Choose: {', '.join(VALID_ROLES)}")
+    teams_col.update_one(
+        {"_id": team["_id"]},
+        {"$set": {"roles": data.roles, "updatedAt": datetime.now(timezone.utc)}}
+    )
+    return {"message": "Roles assigned successfully", "roles": data.roles}
+
+
+# ── Public team page ──────────────────────────────────────────────────────────
+@app.get("/api/teams/{team_id}/public")
+async def get_team_public(team_id: str):
+    try:
+        team = teams_col.find_one({"_id": ObjectId(team_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid team ID")
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+    members = []
+    for mid in team.get("members", []):
+        u = users_col.find_one({"_id": ObjectId(str(mid))}, {"passwordHash": 0, "email": 0, "mobile": 0})
+        if u:
+            uid = str(u["_id"])
+            members.append({
+                "id": uid,
+                "ign": u.get("ign", ""),
+                "ffUid": u.get("ffUid", ""),
+                "fullName": u.get("fullName", ""),
+                "isCaptain": uid == str(team.get("captainId", "")),
+                "isSubstitute": uid == str(team.get("substituteId", "")),
+                "role": team.get("roles", {}).get(uid, None)
+            })
+    registrations = list(registrations_col.find({"teamId": str(team["_id"]), "paymentStatus": "PAID"}))
+    return {
+        "id": str(team["_id"]),
+        "name": team.get("name", ""),
+        "captainId": str(team.get("captainId", "")),
+        "members": members,
+        "memberCount": len(members),
+        "totalTournaments": len(registrations),
+        "createdAt": team.get("createdAt")
+    }
+
+
+# ── Admin: Disqualify team from tournament ────────────────────────────────────
+@app.post("/api/admin/tournaments/{tournament_id}/disqualify-team")
+async def disqualify_team(tournament_id: str, team_id: str, reason: str, admin: dict = Depends(get_admin_user)):
+    reg = registrations_col.find_one({"tournamentId": tournament_id, "teamId": team_id, "paymentStatus": "PAID"})
+    if not reg:
+        raise HTTPException(status_code=404, detail="Registration not found")
+    registrations_col.update_one(
+        {"_id": reg["_id"]},
+        {"$set": {"status": "DISQUALIFIED", "disqualifyReason": reason, "disqualifiedAt": datetime.now(timezone.utc)}}
+    )
+    team = teams_col.find_one({"_id": ObjectId(team_id)})
+    tournament = tournaments_col.find_one({"_id": ObjectId(tournament_id)})
+    if team:
+        for mid in team.get("members", []):
+            try:
+                notifications_col.insert_one({
+                    "userId": str(mid),
+                    "title": "⚠️ Team Disqualified",
+                    "message": f"Your team was disqualified from {tournament.get('name','tournament')}. Reason: {reason}",
+                    "type": "DANGER", "isRead": False,
+                    "link": f"/tournaments/{tournament_id}",
+                    "createdAt": datetime.now(timezone.utc)
+                })
+            except Exception:
+                pass
+    return {"message": "Team disqualified", "teamId": team_id, "reason": reason}
 
 
 @app.delete("/api/teams/member/{member_id}")
@@ -1624,22 +1709,58 @@ async def get_tournament(tournament_id: str):
 
 @app.get("/api/tournaments/{tournament_id}/teams")
 async def get_tournament_teams(tournament_id: str):
-    registrations = list(registrations_col.find({
-        "tournamentId": tournament_id,
-        "paymentStatus": "PAID"
-    }).sort("slotNumber", ASCENDING))
-    
-    teams = []
+    registrations = list(registrations_col.find(
+        {"tournamentId": tournament_id, "paymentStatus": "PAID"}
+    ).sort("slotNumber", ASCENDING))
+    result = []
     for reg in registrations:
-        team = teams_col.find_one({"_id": ObjectId(reg["teamId"])})
-        if team:
-            teams.append({
-                "slotNumber": reg["slotNumber"],
-                "teamName": team["name"],
-                "teamId": str(team["_id"])
-            })
-    
-    return teams
+        team = None
+        if reg.get("teamId"):
+            try:
+                team = teams_col.find_one({"_id": ObjectId(reg["teamId"])})
+            except Exception:
+                pass
+        members_detail = []
+        snapshot = reg.get("memberSnapshot", [])
+        if snapshot:
+            for snap in snapshot:
+                members_detail.append({
+                    "userId": snap.get("userId"),
+                    "ign": snap.get("ign", ""),
+                    "ffUid": snap.get("ffUid", ""),
+                    "fullName": snap.get("fullName", ""),
+                    "role": snap.get("role"),
+                    "isPlaying": snap.get("isPlaying", True),
+                    "isSubstitute": snap.get("isSubstitute", False)
+                })
+        elif team:
+            for mid in team.get("members", []):
+                u = users_col.find_one({"_id": ObjectId(str(mid))}, {"passwordHash": 0})
+                if u:
+                    uid = str(u["_id"])
+                    members_detail.append({
+                        "userId": uid,
+                        "ign": u.get("ign", ""),
+                        "ffUid": u.get("ffUid", ""),
+                        "fullName": u.get("fullName", ""),
+                        "role": team.get("roles", {}).get(uid),
+                        "isPlaying": uid in reg.get("playingMembers", [uid]),
+                        "isSubstitute": uid == str(team.get("substituteId", ""))
+                    })
+        result.append({
+            "registrationId": str(reg["_id"]),
+            "slotNumber": reg["slotNumber"],
+            "teamId": reg.get("teamId", ""),
+            "teamName": team["name"] if team else "Solo",
+            "registeredBy": reg.get("registeredBy", ""),
+            "playingMembers": reg.get("playingMembers", []),
+            "substituteId": reg.get("substituteId"),
+            "members": members_detail,
+            "status": reg.get("status", "ACTIVE"),
+            "disqualifyReason": reg.get("disqualifyReason"),
+            "mode": reg.get("mode", "BR")
+        })
+    return result
 
 @app.get("/api/tournaments/{tournament_id}/standings")
 async def get_tournament_standings(tournament_id: str):
@@ -1725,209 +1846,254 @@ async def get_room_details(tournament_id: str, user: dict = Depends(get_current_
 @app.post("/api/registrations/check-eligibility")
 async def check_eligibility(tournament_id: str, user: dict = Depends(get_current_user)):
     issues = []
-    
-    # Check verification requirements from platform settings
     p_settings = db["platform_settings"].find_one({"key": "main"}) or {}
     if p_settings.get("emailVerifyRequired", False) and not user.get("emailVerified"):
         issues.append({"code": "EMAIL_NOT_VERIFIED", "message": "Email verification required"})
     if p_settings.get("mobileVerifyRequired", False) and not user.get("mobileVerified"):
         issues.append({"code": "MOBILE_NOT_VERIFIED", "message": "Mobile verification required"})
-    
-    # ✅ Fetch tournament FIRST before using it
     tournament = tournaments_col.find_one({"_id": ObjectId(tournament_id)})
-    
-    # Check tournament status
     if not tournament:
         issues.append({"code": "TOURNAMENT_NOT_FOUND", "message": "Tournament not found"})
-    elif tournament["status"] != "REGISTERING":
+        return {"eligible": False, "issues": issues, "team": None}
+    if tournament["status"] != "REGISTERING":
         issues.append({"code": "REGISTRATION_CLOSED", "message": "Registration not open"})
     elif tournament["filledSlots"] >= tournament["maxTeams"]:
         issues.append({"code": "TOURNAMENT_FULL", "message": "Tournament is full"})
-    
-    # Get mode info
-    t_mode = tournament.get("mode", "BR") if tournament else "BR"
-    players_needed = tournament.get("playersPerTeam", 4) if tournament else 4
-    
+    t_mode = tournament.get("mode", "BR")
     solo_modes = ["CS_1v1", "LW_1v1"]
-    duo_modes = ["CS_2v2", "LW_2v2"]
-    
-    # Check team based on mode
-    team = teams_col.find_one({"members": user["id"]})
-    
+    duo_modes  = ["CS_2v2", "LW_2v2"]
+    user_id = user["id"]
+    team = teams_col.find_one({"members": user_id})
     if t_mode in solo_modes:
-        pass  # Solo — no team needed
+        pass  # anyone can play solo
     elif t_mode in duo_modes:
         if not team:
-            issues.append({"code": "NO_TEAM", "message": "Need a duo team for this mode"})
+            issues.append({"code": "NO_TEAM", "message": "You must be in a team for duo mode"})
         elif len(team.get("members", [])) < 2:
-            issues.append({"code": "TEAM_INCOMPLETE", "message": "Team needs 2 members for duo mode"})
-    else:
-        # BR and CS_4v4 — full squad of 4
+            issues.append({"code": "TEAM_INCOMPLETE", "message": "Team needs at least 2 members"})
+    else:  # BR / CS_4v4
         if not team:
-            issues.append({"code": "NO_TEAM", "message": "Not in a team"})
-        elif len(team.get("members", [])) < players_needed:
-            issues.append({"code": "TEAM_INCOMPLETE", "message": f"Team needs {players_needed} members"})
-    
-    # Check active ban
+            issues.append({"code": "NO_TEAM", "message": "You must be in a team"})
+        else:
+            if t_mode == "BR" and str(team.get("captainId", "")) != user_id:
+                issues.append({"code": "NOT_CAPTAIN", "message": "Only the team captain can register for BR tournaments"})
+            if len(team.get("members", [])) < 4:
+                issues.append({"code": "TEAM_INCOMPLETE", "message": "Team needs at least 4 members to register"})
     active_ban = bans_col.find_one({
-        "userId": user["id"],
-        "isActive": True,
+        "userId": user_id, "isActive": True,
         "banType": {"$ne": "MATCH_TERMINATION"},
-        "$or": [
-            {"expiresAt": None},
-            {"expiresAt": {"$gt": datetime.now(timezone.utc)}}
-        ]
+        "$or": [{"expiresAt": None}, {"expiresAt": {"$gt": datetime.now(timezone.utc)}}]
     })
     if active_ban:
         issues.append({"code": "BANNED", "message": f"Account banned: {active_ban['reason']}"})
-    
-    # Check existing registration
     if team:
-        existing = registrations_col.find_one({
-            "tournamentId": tournament_id,
-            "teamId": str(team["_id"])
-        })
+        existing = registrations_col.find_one({"tournamentId": tournament_id, "teamId": str(team["_id"])})
         if existing:
             issues.append({"code": "ALREADY_REGISTERED", "message": "Team already registered"})
-    
     return {
         "eligible": len(issues) == 0,
         "issues": issues,
-        "team": serialize_doc(team) if team else None
+        "team": serialize_doc(team) if team else None,
+        "mode": t_mode,
+        "isCaptain": str(team.get("captainId", "")) == user_id if team else False
     }
 
 @app.post("/api/registrations/create")
-async def create_registration(tournament_id: str, payment_method: str, user: dict = Depends(get_current_user)):
-    # Re-check eligibility
+async def create_registration(
+    tournament_id: str,
+    payment_method: str,
+    playing_member_ids: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
+    import random
     eligibility = await check_eligibility(tournament_id, user)
     if not eligibility["eligible"]:
         raise HTTPException(status_code=400, detail=eligibility["issues"][0]["message"])
-    
     tournament = tournaments_col.find_one({"_id": ObjectId(tournament_id)})
     team = teams_col.find_one({"members": user["id"]})
-    
-    # Get next slot
-    next_slot = tournament["filledSlots"] + 1
-    
-    # Create registration
+    t_mode = tournament.get("mode", "BR")
+    solo_modes = ["CS_1v1", "LW_1v1"]
+    duo_modes  = ["CS_2v2", "LW_2v2"]
+    next_slot  = tournament["filledSlots"] + 1
+    all_members = [str(m) for m in team.get("members", [])] if team else [user["id"]]
+    substitute_id = str(team.get("substituteId", "")) if team and team.get("substituteId") else ""
+
+    if t_mode in solo_modes:
+        playing_members = [user["id"]]
+    elif t_mode in duo_modes:
+        available = [m for m in all_members if m != substitute_id]
+        playing_members = random.sample(available, min(2, len(available)))
+    elif t_mode == "BR":
+        captain_id = str(team.get("captainId", user["id"]))
+        if playing_member_ids:
+            selected = [s.strip() for s in playing_member_ids.split(",") if s.strip()]
+            selected = [m for m in selected if m != captain_id]
+        else:
+            selected = []
+        if len(selected) != 3:
+            raise HTTPException(status_code=400, detail="BR mode: Captain must select exactly 3 other players to join the room")
+        for sel in selected:
+            if sel not in all_members:
+                raise HTTPException(status_code=400, detail=f"Selected player is not in your team")
+        playing_members = [captain_id] + selected
+    else:  # CS_4v4
+        available = [m for m in all_members if m != substitute_id]
+        playing_members = random.sample(available, min(4, len(available)))
+
+    # Build member snapshot
+    member_snapshot = []
+    for mid in all_members:
+        try:
+            u = users_col.find_one({"_id": ObjectId(mid)}, {"passwordHash": 0})
+            if u:
+                member_snapshot.append({
+                    "userId": mid,
+                    "ign": u.get("ign", ""),
+                    "ffUid": u.get("ffUid", ""),
+                    "fullName": u.get("fullName", ""),
+                    "role": team.get("roles", {}).get(mid) if team else None,
+                    "isPlaying": mid in playing_members,
+                    "isSubstitute": mid == substitute_id
+                })
+        except Exception:
+            pass
+
     reg_doc = {
         "tournamentId": tournament_id,
-        "teamId": str(team["_id"]),
+        "teamId": str(team["_id"]) if team else user["id"],
+        "registeredBy": user["id"],
         "slotNumber": next_slot,
         "paymentStatus": "PENDING",
         "paymentMethod": payment_method,
         "amountPaid": tournament["entryFee"],
+        "playingMembers": playing_members,
+        "substituteId": substitute_id or None,
+        "memberSnapshot": member_snapshot,
+        "mode": t_mode,
+        "status": "ACTIVE",
         "registeredAt": datetime.now(timezone.utc)
     }
-    
+
     if payment_method == "wallet":
-        # Entry fee split equally among team members
-        t_mode = tournament.get("mode", "BR")
-        solo_modes = ["CS_1v1", "LW_1v1"]
-        duo_modes = ["CS_2v2", "LW_2v2"]
-        
-        if t_mode in solo_modes:
-            players_count = 1
-        elif t_mode in duo_modes:
-            players_count = 2
-        else:
-            players_count = 4
-        
+        players_count = len(playing_members) or 1
         per_player_fee = round(tournament["entryFee"] / players_count, 2)
-        
-        # Deduct from each team member
-        current_team = teams_col.find_one({"members": user["id"]}) if t_mode not in solo_modes else None
-        members_to_charge = [user["id"]] if t_mode in solo_modes else (current_team.get("members", [user["id"]]) if current_team else [user["id"]])
-        
-        # Check all members have enough balance
-        for member_id in members_to_charge:
-            member = users_col.find_one({"_id": ObjectId(member_id)})
-            if member and member.get("walletBalance", 0) < per_player_fee:
-                raise HTTPException(status_code=400, detail=f"Insufficient balance for {member.get('ign','member')} (needs ₹{per_player_fee})")
-        
-        # Charge each member
-        for member_id in members_to_charge:
-            member = users_col.find_one({"_id": ObjectId(member_id)})
-            if member:
-                new_bal = member.get("walletBalance", 0) - per_player_fee
-                users_col.update_one({"_id": ObjectId(member_id)}, {"$set": {"walletBalance": new_bal}})
-                transactions_col.insert_one({
-                    "userId": member_id,
-                    "type": "DEBIT",
-                    "amount": -per_player_fee,
-                    "description": f"Tournament: {tournament['name']} (₹{per_player_fee}/player)",
-                    "tournamentId": tournament_id,
-                    "balanceBefore": member.get("walletBalance", 0),
-                    "balanceAfter": new_bal,
-                    "createdAt": datetime.now(timezone.utc)
-                })
-        
-        # Use user's balance for reg_doc tracking
-        new_balance = user.get("walletBalance", 0) - per_player_fee
-        users_col.update_one({"_id": ObjectId(user["id"])}, {"$set": {"walletBalance": new_balance}})
-        
-        # Dummy transaction (already recorded per member above, skip duplicate)
-        if not current_team or user["id"] == members_to_charge[0]:
-            pass  # already recorded above
-        
-        # Set amount paid on registration = full entry fee
-        reg_doc["amountPaid"] = tournament["entryFee"]
-        
-        # Create transaction — kept for backward compat
-        transactions_col.insert_one({
-            "userId": user["id"],
-            "type": "DEBIT",
-            "amount": -tournament["entryFee"],
-            "description": f"Tournament registration: {tournament['name']} (₹{per_player_fee}×{players_count})",
-            "tournamentId": tournament_id,
-            "balanceBefore": user["walletBalance"],
-            "balanceAfter": new_balance,
-            "createdAt": datetime.now(timezone.utc)
-        })
-        
+        for member_id in playing_members:
+            try:
+                member = users_col.find_one({"_id": ObjectId(member_id)})
+                if member and member.get("walletBalance", 0) < per_player_fee:
+                    raise HTTPException(status_code=400, detail=f"Insufficient balance for {member.get('ign','a member')} (needs ₹{per_player_fee})")
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+        for member_id in playing_members:
+            try:
+                member = users_col.find_one({"_id": ObjectId(member_id)})
+                if member:
+                    new_bal = round(member.get("walletBalance", 0) - per_player_fee, 2)
+                    users_col.update_one({"_id": ObjectId(member_id)}, {"$set": {"walletBalance": new_bal}})
+                    transactions_col.insert_one({
+                        "userId": member_id, "type": "DEBIT",
+                        "amount": -per_player_fee,
+                        "description": f"Tournament entry: {tournament['name']} (₹{per_player_fee}/player)",
+                        "tournamentId": tournament_id,
+                        "balanceBefore": member.get("walletBalance", 0),
+                        "balanceAfter": new_bal,
+                        "createdAt": datetime.now(timezone.utc)
+                    })
+            except Exception:
+                pass
         reg_doc["paymentStatus"] = "PAID"
         reg_doc["confirmedAt"] = datetime.now(timezone.utc)
-    
+
     result = registrations_col.insert_one(reg_doc)
-    
-    # Update tournament slots
+
     if reg_doc["paymentStatus"] == "PAID":
-        tournaments_col.update_one(
-            {"_id": ObjectId(tournament_id)},
-            {"$inc": {"filledSlots": 1}}
-        )
-        
-        # Send confirmation notification
-        notifications_col.insert_one({
-            "userId": user["id"],
-            "title": "Registration Confirmed!",
-            "message": f"Slot #{next_slot} confirmed for {tournament['name']}",
-            "type": "SUCCESS",
-            "isRead": False,
-            "link": f"/tournaments/{tournament_id}",
-            "createdAt": datetime.now(timezone.utc)
-        })
-        
-        # Notify all team members
-        for member_id in team.get("members", []):
-            if member_id != user["id"]:
+        tournaments_col.update_one({"_id": ObjectId(tournament_id)}, {"$inc": {"filledSlots": 1}})
+        for mid in all_members:
+            try:
+                is_playing = mid in playing_members
                 notifications_col.insert_one({
-                    "userId": member_id,
-                    "title": "Team Registered!",
-                    "message": f"Your team registered for {tournament['name']} - Slot #{next_slot}",
-                    "type": "SUCCESS",
-                    "isRead": False,
+                    "userId": str(mid),
+                    "title": "🎮 Team Registered!",
+                    "message": f"Slot #{next_slot} confirmed for {tournament['name']}. " + ("You are PLAYING! 🔥" if is_playing else "You are SUBSTITUTE 🟡"),
+                    "type": "SUCCESS", "isRead": False,
+                    "link": f"/tournaments/{tournament_id}",
                     "createdAt": datetime.now(timezone.utc)
                 })
-        
-        print(f"[EMAIL] Tournament confirmation sent to team members")
-    
+            except Exception:
+                pass
+
     return {
         "registrationId": str(result.inserted_id),
         "slotNumber": next_slot,
         "paymentStatus": reg_doc["paymentStatus"],
-        "amountPaid": tournament["entryFee"]
+        "amountPaid": tournament["entryFee"],
+        "playingMembers": playing_members,
+        "substituteId": substitute_id or None,
+        "mode": t_mode
     }
+
+@app.patch("/api/teams/members/{member_id}/role")
+async def assign_member_role(
+    member_id: str,
+    body: dict,
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        role = body.get("role")  # None = clear role
+
+        # Your current_user uses "id" key (confirmed from logs)
+        captain_raw = current_user.get("id") or current_user.get("_id")
+        if not captain_raw:
+            raise HTTPException(status_code=401, detail="Cannot identify current user")
+
+        captain_id_str = str(captain_raw).strip()
+
+        # Find team where current user is captain
+        team = teams_col.find_one({
+            "$or": [
+                {"captainId": captain_id_str},
+                {"captainId": ObjectId(captain_id_str)},
+            ]
+        })
+
+        if not team:
+            raise HTTPException(status_code=403, detail="Only the captain can assign roles")
+
+        # Check member is in this team
+        team_members = [str(m) for m in team.get("members", [])]
+        if member_id not in team_members:
+            raise HTTPException(status_code=404, detail="Member not found in your team")
+
+        # ✅ Roles stored on TEAM document as { memberId: roleName }
+        if role:
+            teams_col.update_one(
+                {"_id": team["_id"]},
+                {
+                    "$set": {
+                        f"roles.{member_id}": role,
+                        "updatedAt": datetime.now(timezone.utc)
+                    }
+                }
+            )
+        else:
+            # Clear role
+            teams_col.update_one(
+                {"_id": team["_id"]},
+                {
+                    "$unset": {f"roles.{member_id}": ""},
+                    "$set": {"updatedAt": datetime.now(timezone.utc)}
+                }
+            )
+
+        return {"success": True, "memberId": member_id, "role": role}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[assign_member_role] ERROR: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/player/tournaments")
 async def get_player_tournaments(user: dict = Depends(get_current_user)):
