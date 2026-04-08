@@ -85,7 +85,7 @@ SMTP_HOST = os.environ.get("SMTP_HOST", "mail.osglive.in")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 SMTP_USER = os.environ.get("SMTP_USER", "no-reply-otp-reset@osglive.in")
 SMTP_PASS = os.environ.get("SMTP_PASS", "I;5AewttB(LGuj~b")
-SMTP_FROM = os.environ.get("SMTP_FROM", "OSG LIVE <no-reply-otp-verify@osglive.in>")
+SMTP_FROM = os.environ.get("SMTP_FROM", "OSG LIVE <otp-reset-verify-noreply@osglive.in>")
 
 
 def send_email(to_email: str, subject: str, html_body: str):
