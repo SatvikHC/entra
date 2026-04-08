@@ -800,7 +800,7 @@ async def send_email_otp(email: str, request: Request):
         <div style="font-size:48px;font-weight:bold;color:#FFD700;letter-spacing:8px">{otp}</div>
         <p style="color:#52525B;font-size:12px">Valid for 10 minutes. Do not share this code.</p>
       </div>
-      <p style="color:#52525B;font-size:11px;margin-top:20px">OSG LIVE | support@tg.toonverse.icu</p>
+      <p style="color:#52525B;font-size:11px;margin-top:20px">OSG LIVE | Contact Discord : https://discord.gg/gQFAgZKATS </p>
     </div>
     """
     
@@ -4150,7 +4150,7 @@ async def seed_special_test():
 async def get_platform_settings(admin: dict = Depends(get_admin_user)):
     settings = db["platform_settings"].find_one({"key": "main"})
     if not settings:
-        return {"emailVerifyRequired": False, "mobileVerifyRequired": False, "maintenanceMode": False, "discordUrl": "https://discord.gg/bpXVqbBN"}
+        return {"emailVerifyRequired": False, "mobileVerifyRequired": False, "maintenanceMode": False, "discordUrl": "https://discord.gg/gQFAgZKATS"}
     s = serialize_doc(settings)
     return s
 
@@ -4166,11 +4166,11 @@ async def get_public_platform_settings():
     """Public endpoint — no auth needed"""
     settings = db["platform_settings"].find_one({"key": "main"})
     if not settings:
-        return {"emailVerifyRequired": False, "mobileVerifyRequired": False, "discordUrl": "https://discord.gg/bpXVqbBN"}
+        return {"emailVerifyRequired": False, "mobileVerifyRequired": False, "discordUrl": "https://discord.gg/gQFAgZKATS"}
     return {
         "emailVerifyRequired": settings.get("emailVerifyRequired", False),
         "mobileVerifyRequired": settings.get("mobileVerifyRequired", False),
-        "discordUrl": settings.get("discordUrl", "https://discord.gg/bpXVqbBN")
+        "discordUrl": settings.get("discordUrl", "https://discord.gg/gQFAgZKATS")
     }
 
 @app.get("/api/admin/debug/standings/{tournament_id}")
