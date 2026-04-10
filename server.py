@@ -30,7 +30,13 @@ import uuid
 import secrets
 
 # Initialize FastAPI
-app = FastAPI(title="OSG LIVE API", version="1.0.0")
+app = FastAPI(
+    title="OSG LIVE API",
+    version="1.0.0",
+    docs_url="/my-secret-docs-x9k2",   # only you know this
+    redoc_url=None,
+    openapi_url="/my-secret-openapi-x9k2.json",
+)
 
 # ─── Helper: safely extract user _id as plain string ─────────────────────────
 def get_user_id_str(user: dict) -> str:
@@ -38,9 +44,15 @@ def get_user_id_str(user: dict) -> str:
     return str(raw).strip()
 
 # CORS
+# CORS - production locked, dev fallback
+ALLOWED_ORIGINS = os.environ.get(
+    "CORS_ORIGINS",
+    "https://osglive.in,https://www.osglive.in"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
